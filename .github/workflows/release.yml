@@ -1,7 +1,9 @@
 name: Release
 
 # Build installers whenever a GitHub Release is published, and attach the
-# artifacts to that release. Builds are UNSIGNED for now (open-source tool).
+# artifacts to that release. macOS builds are signed with the ANP Labs
+# Developer ID and notarized when the signing secrets are set (see
+# docs/RELEASING.md); Windows builds are unsigned.
 on:
   release:
     types: [published]
@@ -21,10 +23,8 @@ jobs:
         include:
           - os: macos-latest
             name: macOS
-            build: npm run dist:mac
           - os: windows-latest
             name: Windows
-            build: npm run dist:win
     steps:
       - uses: actions/checkout@v4
 
@@ -36,14 +36,49 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Build installers (ad-hoc signed on macOS)
-        run: ${{ matrix.build }}
+      - name: Build installers (macOS, signed + notarized)
+        if: runner.os == 'macOS'
+        shell: bash
         env:
-          # No Apple Developer ID / notarization yet. Don't auto-discover a real
-          # cert; the mac build config's `"identity": "-"` ad-hoc signs instead
-          # (codesign -s -), which is required for Apple Silicon apps to launch
-          # at all — a fully unsigned arm64 .app is reported as "damaged" once
-          # macOS quarantines the download.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Base64 of the "Developer ID Application" certificate + private key
+          # exported as .p12. electron-builder imports it into a temp keychain.
+          CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          # App Store Connect API key for notarization (the .p8 file contents).
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          if [ -z "$CSC_LINK" ]; then
+            # Forks and repos without the secrets still get a launchable build:
+            # ad-hoc signed (an unsigned arm64 app is reported as "damaged"),
+            # not notarized, and unable to apply auto-updates.
+            echo "::warning::MAC_CERT_P12_BASE64 is not set; building an ad-hoc signed, non-notarized app."
+            unset CSC_LINK CSC_KEY_PASSWORD
+            CSC_IDENTITY_AUTO_DISCOVERY=false npm run dist:mac:unsigned
+            exit 0
+          fi
+          if [ -z "$APPLE_API_KEY_P8" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER" ]; then
+            echo "::error::Signing is configured but the notarization secrets (APPLE_API_KEY_P8, APPLE_API_KEY_ID, APPLE_API_ISSUER) are not all set."
+            exit 1
+          fi
+          # electron-builder wants APPLE_API_KEY as a path to the .p8 file.
+          export APPLE_API_KEY="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY"
+          # forceCodeSigning: fail the release instead of shipping an unsigned app.
+          npm run dist:mac -- -c.forceCodeSigning=true
+          rm -f "$APPLE_API_KEY"
+          for app in release/mac*/Ployd.app; do
+            codesign --verify --deep --strict --verbose=2 "$app"
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose=4 "$app"
+          done
+
+      - name: Build installers (Windows, unsigned)
+        if: runner.os == 'Windows'
+        run: npm run dist:win
+        env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
