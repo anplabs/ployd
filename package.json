@@ -14,6 +14,7 @@
     "dist": "npm run build && electron-builder --mac",
     "dist:win": "npm run build && electron-builder --win",
     "dist:mac": "npm run build && electron-builder --mac",
+    "dist:mac:unsigned": "npm run build && electron-builder --mac -c.mac.identity=- -c.mac.hardenedRuntime=false",
     "pack": "npm run build && electron-builder --dir"
   },
   "keywords": [
@@ -40,13 +41,13 @@
   ],
   "author": "Paulo Lima <pflima92@gmail.com>",
   "license": "MIT",
-  "homepage": "https://github.com/PauloLimaHQ/ployd#readme",
+  "homepage": "https://github.com/anplabs/ployd#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PauloLimaHQ/ployd.git"
+    "url": "git+https://github.com/anplabs/ployd.git"
   },
   "bugs": {
-    "url": "https://github.com/PauloLimaHQ/ployd/issues"
+    "url": "https://github.com/anplabs/ployd/issues"
   },
   "engines": {
     "node": ">=18"
@@ -68,7 +69,7 @@
     "typescript-eslint": "^8.20.0"
   },
   "build": {
-    "appId": "com.pauloperego.ployd",
+    "appId": "io.anplabs.ployd",
     "productName": "Ployd",
     "copyright": "Copyright © 2026 Paulo Lima",
     "asar": true,
@@ -85,7 +86,7 @@
     },
     "publish": {
       "provider": "github",
-      "owner": "PauloLimaHQ",
+      "owner": "anplabs",
       "repo": "ployd"
     },
     "mac": {
@@ -107,8 +108,10 @@
           ]
         }
       ],
-      "identity": "-",
-      "hardenedRuntime": false,
+      "identity": "ANP DESENVOLVIMENTO DE SOFTWARE LTDA (Y87W583VKZ)",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
       "gatekeeperAssess": false,
       "extendInfo": {
         "LSUIElement": false,
@@ -136,6 +139,7 @@
       ]
     },
     "nsis": {
+      "guid": "d590ff8b-0dce-5915-8276-d2ebd7f360a1",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true

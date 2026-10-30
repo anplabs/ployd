@@ -969,19 +969,29 @@ respect the invariants above, run lint + test, and summarize the diff and any ri
 - Ployd shipped as **Sr. Popo** with another bundle id, so to the OS it is a different
   app. `electron/legacy.ts` takes over an old install on first launch (userData,
   `~/.srpopo/worktrees`, the old bundle and caches); a still-running Sr. Popo makes
-  that launch quit with a dialog instead of booting an empty board. Keep the new
-  `appId` (`com.pauloperego.ployd`) stable from here on.
+  that launch quit with a dialog instead of booting an empty board.
+- The `appId` is `io.anplabs.ployd` (it was `com.pauloperego.ployd` until the move to
+  ANP Labs). Keep it stable from here on. The rename was safe only because userData is
+  keyed by the app *name* (`app.setName('Ployd')`), not the id, and because
+  `nsis.guid` is pinned to the GUID electron-builder derived from the **old** id —
+  without it, the Windows installer registers a second "Ployd" next to the old one
+  instead of upgrading it. Never change or drop `nsis.guid`.
 - Orphaned `running` tasks from a crash are auto-marked `failed` on server start
   (`store.js`) — don't "fix" that by resurrecting them as running.
 - `db.json` is written atomically (temp file + rename) and debounced; go through
   `store.save()` rather than writing it directly.
 - The packaged app runs from a read-only bundle — never write inside the app dir; use
   `PLOYD_DATA_DIR`.
-- Builds are unsigned for now; don't add signing/notarization steps without the
-  credentials being configured. This means macOS auto-update can download and
-  verify a new version, but Squirrel.Mac (the native installer electron-updater
-  drives on macOS) refuses to actually apply it without a real Developer ID
-  signature — an ad-hoc-signed build fails that step silently in the background.
-  `electron/main.ts` detects the failure and swaps the "Relaunch to update"
-  banner for a manual-download link (`ployd:update-install-failed`) instead of
-  leaving a button that does nothing. Don't "fix" it by ignoring the error.
+- macOS release builds are signed with the ANP Labs **Developer ID** and notarized
+  (hardened runtime, `build/entitlements.mac.plist`); `release.yml` reads the
+  certificate and the App Store Connect key from repo secrets — see
+  `docs/RELEASING.md`. Without the secrets it falls back to `dist:mac:unsigned`
+  (ad-hoc), which is also the local path for anyone without the certificate.
+  Windows stays unsigned. Squirrel.Mac (the native installer electron-updater
+  drives on macOS) refuses to apply an update the running app's code requirement
+  doesn't accept — always the case for an ad-hoc build, including every install
+  from before signing was turned on. `electron/main.ts` detects the failure and
+  swaps the "Relaunch to update" banner for a manual-download link
+  (`ployd:update-install-failed`) instead of leaving a button that does nothing.
+  Don't "fix" it by ignoring the error. If you add an entitlement, keep it to
+  what the hardened runtime actually blocks — the app is not sandboxed.

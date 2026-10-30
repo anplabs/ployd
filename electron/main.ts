@@ -46,15 +46,14 @@ let updateReadyVersion: string | null = null; // set once electron-updater has a
 let updateDownloadingVersion: string | null = null; // set while a new version is downloading in the background
 let updateInstallFailed = false; // set once we know the native installer can't apply an update this run
 
-// package.json's mac.identity is "-" (ad-hoc) — there's no paid Apple Developer
-// ID configured yet (see CLAUDE.md's "Builds are unsigned" gotcha). That's
-// enough for an arm64 build to launch, but Squirrel.Mac — the native installer
-// electron-updater drives under the hood on macOS — requires a real Developer
-// ID signature to actually apply an update; an ad-hoc build downloads and
-// "verifies" fine, then fails that install step silently in the background.
-// Recognize it and fall back to "download manually" instead of a Relaunch
-// button that does nothing.
-const RELEASES_URL = 'https://github.com/PauloLimaHQ/ployd/releases/latest';
+// Release builds are Developer ID signed, but an ad-hoc one (`dist:mac:unsigned`,
+// a fork's CI, or any install that predates signing) can still be running.
+// Squirrel.Mac — the native installer electron-updater drives under the hood on
+// macOS — requires the update to satisfy the running app's code requirement; an
+// ad-hoc build downloads and "verifies" fine, then fails that install step
+// silently in the background. Recognize it and fall back to "download manually"
+// instead of a Relaunch button that does nothing.
+const RELEASES_URL = 'https://github.com/anplabs/ployd/releases/latest';
 
 function notifyUpdateInstallFailed(): void {
   updateReadyVersion = null;
@@ -286,11 +285,11 @@ function buildAppMenu(): void {
       submenu: [
         {
           label: 'Ployd Documentation',
-          click: () => shell.openExternal('https://github.com/PauloLimaHQ/ployd#readme'),
+          click: () => shell.openExternal('https://github.com/anplabs/ployd#readme'),
         },
         {
           label: 'Report an Issue…',
-          click: () => shell.openExternal('https://github.com/PauloLimaHQ/ployd/issues'),
+          click: () => shell.openExternal('https://github.com/anplabs/ployd/issues'),
         },
         { type: 'separator' },
         {

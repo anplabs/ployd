@@ -12,8 +12,8 @@ Pick your backend per task — **Claude Code**, **OpenAI Codex** or **xAI Grok**
 entirely on
 your machine and drives your existing **subscription** login — never an API key.
 
-[![Release](https://img.shields.io/github/v/release/PauloLimaHQ/ployd?label=download&color=orange)](https://github.com/PauloLimaHQ/ployd/releases/latest)
-[![CI](https://github.com/PauloLimaHQ/ployd/actions/workflows/ci.yml/badge.svg)](https://github.com/PauloLimaHQ/ployd/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/anplabs/ployd?label=download&color=orange)](https://github.com/anplabs/ployd/releases/latest)
+[![CI](https://github.com/anplabs/ployd/actions/workflows/ci.yml/badge.svg)](https://github.com/anplabs/ployd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 ![Platform: macOS · Windows](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows-lightgrey)
 
@@ -21,25 +21,20 @@ your machine and drives your existing **subscription** login — never an API ke
 
 ## Download
 
-Grab the latest installer from the **[Releases page →](https://github.com/PauloLimaHQ/ployd/releases/latest)**
+Grab the latest installer from the **[Releases page →](https://github.com/anplabs/ployd/releases/latest)**
 
 | Platform | File |
 |---|---|
 | **macOS** (Apple Silicon + Intel) | `Ployd-*.dmg` |
 | **Windows** (x64) | `Ployd-Setup-*.exe` |
 
-Builds are **unsigned** (ad-hoc signed only, no Apple Developer ID / notarization)
-for now, so your OS will warn on first launch:
+The macOS app is signed with the ANP Labs Apple Developer ID and notarized by Apple,
+so it opens with no Gatekeeper warning. The Windows installer is unsigned, so
+SmartScreen warns on first launch: choose **More info → Run anyway**.
 
-- **macOS** — right-click the app → **Open** to bypass Gatekeeper (once).
-- **Windows** — on the SmartScreen prompt, choose **More info → Run anyway**.
-
-> **macOS says the app is "damaged and can't be opened"?** That's the download's
-> quarantine flag on an unsigned app, not a corrupt file. Clear it with:
-> ```bash
-> xattr -dr com.apple.quarantine "/Applications/Ployd.app"
-> ```
-> then open it normally. (Newer builds are ad-hoc signed, which avoids this.)
+> Builds older than the first signed release were ad-hoc signed. They cannot apply
+> an auto-update to a signed build. If you use one of them, download the new `.dmg`
+> once from the Releases page. Updates install automatically after that.
 
 > **Prefer to run from source?** See [Develop](#develop) below.
 
@@ -184,17 +179,19 @@ on macOS + Windows.
 ### Build installers locally
 
 ```bash
-npm run dist:mac   # → release/  macOS .dmg + .zip (arm64 + x64)
-npm run dist:win   # → release/  Windows .exe installer + .zip (x64)
-npm run pack       # unpacked app for quick local testing
+npm run dist:mac          # → release/  macOS .dmg + .zip (arm64 + x64), Developer ID signed
+npm run dist:mac:unsigned # → release/  the same, ad-hoc signed (no Apple certificate needed)
+npm run dist:win          # → release/  Windows .exe installer + .zip (x64)
+npm run pack              # unpacked app for quick local testing
 ```
 
 ### Cutting a release
 
-Releases are automated by `.github/workflows/release.yml`: bump `version` in
-`package.json`, tag it, and **publish a GitHub Release** for that tag — the workflow
-builds the unsigned macOS + Windows installers and attaches them to the release (which
-is exactly what the [Download](#download) links above point to).
+The workflow `.github/workflows/release.yml` builds each release. Bump `version` in
+`package.json`, tag it, and publish a GitHub Release for that tag. The workflow
+signs and notarizes the macOS app, builds the Windows installer, and attaches both
+to the release. [`docs/RELEASING.md`](./docs/RELEASING.md) gives the one-time
+signing setup.
 
 ## Where data lives
 
