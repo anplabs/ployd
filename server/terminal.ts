@@ -3,6 +3,8 @@ import path from 'path';
 import { spawn } from 'child_process';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { Writable } from 'stream';
+import { StatusParser, applyEvent, onInput, reportedStatus, QUERY_REPLY } from './programStatus';
+import type { Reported } from './programStatus';
 import * as bus from './bus';
 import { id, DATA_DIR } from './store';
 import * as runner from './runner';
@@ -34,8 +36,9 @@ import type { SessionAgent } from './types';
 
 type Kind = 'shell' | 'claude' | 'codex' | 'grok' | 'custom';
 // active = alive and printing; idle = alive but quiet (sitting at a prompt,
-// waiting for you); exited = the process is gone. The board renders them as a
-// green / amber / red bullet.
+// waiting for you), unless the agent inside reports its own state through
+// OSC 7501 (see statusOf); exited = the process is gone. The board renders them
+// as a green / amber / red bullet.
 type Status = 'active' | 'idle' | 'exited';
 
 interface Session {
@@ -65,6 +68,12 @@ interface Session {
   lastActivity: number;
   // The status last broadcast, so the sweep below only emits real transitions.
   status: Status;
+  // What the program inside last said it was doing through OSC 7501 (see
+  // server/programStatus.ts), or null when nothing has reported — or the
+  // report has since ended. While set, it decides the status, not the timer.
+  reported: Reported | null;
+  // Finds those reports in the output, carrying a sequence cut across reads.
+  statusParser: StatusParser;
 }
 
 interface Summary {
@@ -123,9 +132,27 @@ function shQuote(s: string): string {
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+// Two sources: an agent that speaks OSC 7501 says itself whether it is working
+// (and a silent, thinking agent stays active); anything else is graded by the
+// silence timer.
 function statusOf(s: Session): Status {
   if (s.exited) return 'exited';
-  return Date.now() - s.lastActivity > IDLE_MS ? 'idle' : 'active';
+  const quiet = Date.now() - s.lastActivity;
+  if (s.reported) return reportedStatus(s.reported, quiet);
+  return quiet > IDLE_MS ? 'idle' : 'active';
+}
+
+// Reads OSC 7501 out of a chunk of pty output. The only thing ever written back
+// is the protocol's fixed feature-detection reply, and only on a real pty (the
+// Windows pipe fallback has no terminal to speak for).
+function trackStatus(s: Session, chunk: Buffer): void {
+  for (const e of s.statusParser.feed(chunk)) {
+    if (e.type === 'query') {
+      if (s.control && !s.exited) s.child.stdin.write(QUERY_REPLY);
+    } else {
+      applyEvent(s, e);
+    }
+  }
 }
 
 function summary(s: Session): Summary {
@@ -302,6 +329,8 @@ function create(opts: {
     bufferBytes: 0,
     listeners: new Set(),
     exited: false,
+    reported: null,
+    statusParser: new StatusParser(),
     createdAt: restored ? restored.createdAt : new Date().toISOString(),
     lastActivity: Date.now(),
     status: 'active',
@@ -325,7 +354,8 @@ function create(opts: {
       session.bufferBytes -= session.buffer.shift()!.length;
     }
     session.lastActivity = Date.now();
-    if (session.status !== 'active') announce(session);
+    trackStatus(session, chunk);
+    if (statusOf(session) !== session.status) announce(session);
     for (const fn of session.listeners) fn(b64);
   };
   // A restored session's notice goes first in the buffer, so it is the top line
@@ -386,7 +416,8 @@ function write(sid: string, data: string): boolean {
   if (!s || s.exited) return false;
   s.child.stdin.write(data);
   s.lastActivity = Date.now();
-  if (s.status !== 'active') announce(s);
+  onInput(s, data);
+  if (statusOf(s) !== s.status) announce(s);
   return true;
 }
 
