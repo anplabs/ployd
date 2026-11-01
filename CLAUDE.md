@@ -68,6 +68,7 @@ static with **no build step** (see Conventions).
 | `public/core/` | What every feature needs: `state.js` (the shared board state, `$`, `icon`, column constants) and `api.js` (`api()`, `toast()`, `esc()`, `lookup()`). Imports nothing from `features/` — it is the bottom of the graph. |
 | `public/features/` | One module per feature (`board.js`, `task-modal.js`, `drawer.js`, `pr.js`, `autonomous.js`, …). A feature change should touch one file here. |
 | `public/features/home.js` | The Super View's front door: the centered New-Task composer and the recent-tasks list (see "Home: the Super View's composer"). The workspace grid below them stays in `workspaces.js`. |
+| `public/features/list-view.js` | The board's list view: the same cards as one table grouped by column, sortable, with collapsible groups. Shares `#board` with the Kanban; which one shows is a per-device preference (see "Board and list views"). |
 | `public/features/tabs.js` | The work area's tab strip in the sidebar layout — one tab per open project board and per shell session, plus the pinned Super View tab. Owns `#workarea`'s pane visibility (`applyPanes`), so `renderView()` and `focusSession()` both defer to it. No-op in the classic layout (see "The tabbed work area"). |
 | `public/icons.js` | Inline-SVG icon set (Lucide) + a tiny renderer/hydrator. Loaded as a **classic script before the module graph**, so it publishes `window.ploydIcons` rather than exporting. The only source of UI glyphs — no emojis. |
 | `tests/smoke.test.ts` | `node:test` smoke suite, run via `tsx`. |
@@ -661,6 +662,29 @@ ctrlKey`, because off macOS it is Ctrl+W / Ctrl+D — which a focused shell keep
 (kill-word and EOF) — and the Electron menu carries the same two items with
 `registerAccelerator: false`, so the keystroke reaches the page instead of the system
 menu (which is also why **Close Window** moved to ⇧⌘W).
+
+## Board and list views
+
+A workspace shows its cards in one of two shapes. The **Board** is the Kanban.
+The **List** (`public/features/list-view.js`) is one table: a group per column
+in board order, one row per card, with Agent, Branch / PR, Grade, Cost and
+Updated columns. You pick the shape with the Board / List switch at the right
+end of the filter bar, or with the ⌘K command "Switch to List View".
+
+- **Same data.** `renderBoard()` hands the list the cards it would draw, already
+  scoped to the workspace and filtered by the search box. The two views cannot
+  disagree about what exists.
+- **Same actions.** A row opens the same drawer. Right-click, or the row's "…"
+  button, opens the same context menu a card has. The list has no drag-and-drop,
+  so a status change goes through that menu.
+- **Per-device preferences.** `ployd.boardView` (`board` | `list`, written for
+  both values), `ployd.listSort` and `ployd.listCollapsed` live in
+  `localStorage`, never in `db.json`. Done starts collapsed. Empty groups are
+  not shown.
+- **Redrawn on every tick.** The list keeps the focused row and the scroll
+  position across a redraw. For this reason `renderBoard()` empties `#board`
+  only on the Kanban path. Keyboard: ↑/↓ or j/k move between rows, Enter opens,
+  Shift+F10 opens the menu.
 
 ## Home: the Super View's composer
 

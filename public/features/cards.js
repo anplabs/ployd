@@ -301,4 +301,4 @@ export function init() {
 }
 
 
-export { GRADE_MEANINGS, GROOMING_TARGET_LABEL, orchestrationTaskLinksHtml, renderCard, renderGroomingCard, renderOrchestrationCard };
+export { GRADE_MEANINGS, GROOMING_TARGET_LABEL, orchestrationTaskLinksHtml, renderCard, renderGroomingCard, renderOrchestrationCard, stopGrooming, stopOrchestration };

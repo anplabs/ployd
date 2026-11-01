@@ -266,6 +266,12 @@
         </div>
         <button class="filter-clear hidden" id="filter-clear" title="Clear filters">Clear<span class="i" data-icon="x"></span></button>
         <span class="filter-count" id="filter-count"></span>
+        <!-- Board or list: the same cards as Kanban columns or as one grouped
+             table (features/list-view.js). A per-device preference. -->
+        <div class="view-toggle" id="view-toggle" role="group" aria-label="Board view">
+          <button type="button" class="view-toggle-btn" data-view="board" aria-pressed="true" title="Board view: one column per stage"><span class="i" data-icon="kanban"></span><span class="btn-label">Board</span></button>
+          <button type="button" class="view-toggle-btn" data-view="list" aria-pressed="false" title="List view: every task in one table, grouped by stage"><span class="i" data-icon="list"></span><span class="btn-label">List</span></button>
+        </div>
       </div>
 
       <!-- The Super View, a.k.a. Home. Three stacked blocks: a centered composer

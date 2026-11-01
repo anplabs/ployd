@@ -1137,6 +1137,121 @@ body[data-layout="sidebar"] #workspace-back { display: none; }
   border: 1.5px dashed var(--border); border-radius: var(--radius-md); margin: 2px 0;
 }
 
+/* ── list view ──
+   The board's second shape (features/list-view.js): the same cards as one
+   table, grouped by stage. It reuses #board, so `.board-list` swaps the flex
+   lanes for a single scrolling sheet. */
+.board.board-list { display: block; overflow: auto; }
+.view-toggle {
+  display: inline-flex; align-items: center; gap: 2px; padding: 2px;
+  background: var(--bg); border: 1px solid var(--hairline); border-radius: var(--radius-pill);
+}
+.view-toggle-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 0; background: transparent; color: var(--text-dim);
+  padding: 4px 11px; border-radius: var(--radius-pill); cursor: pointer;
+  font-size: 12px; font-weight: 500;
+  transition: background .15s, color .15s;
+}
+.view-toggle-btn .icon { width: 14px; height: 14px; }
+.view-toggle-btn:hover { color: var(--text); }
+.view-toggle-btn.active { background: var(--bg-card); color: var(--text); box-shadow: var(--shadow-card); }
+.view-toggle-btn:focus-visible { outline: none; box-shadow: var(--ring); }
+
+.task-list {
+  width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed;
+  font-size: 13px;
+}
+/* Fixed layout takes its widths from the header row; the title column gets
+   whatever is left, so long titles wrap instead of pushing columns off. */
+.task-list thead .tl-col-agent { width: 170px; }
+.task-list thead .tl-col-branch { width: 210px; }
+.task-list thead .tl-col-grade { width: 72px; }
+.task-list thead .tl-col-cost { width: 84px; }
+.task-list thead .tl-col-updated { width: 92px; }
+.task-list thead .tl-col-actions { width: 132px; }
+.task-list thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--bg-card); text-align: left;
+  font-size: 11.5px; font-weight: 600; color: var(--text-dim);
+  padding: 8px 10px; border-bottom: 1px solid var(--hairline);
+}
+.tl-sort {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 0; background: transparent; color: inherit; font: inherit;
+  padding: 2px 4px; margin: -2px -4px; border-radius: 6px; cursor: pointer;
+}
+.tl-sort:hover, .tl-sort.active { color: var(--text); }
+.tl-sort:focus-visible { outline: none; box-shadow: var(--ring); }
+.tl-sort .icon { width: 12px; height: 12px; }
+
+.tl-group-head th, .tl-group-head td { padding: 14px 4px 4px; text-align: left; white-space: nowrap; }
+.tl-group-toggle {
+  display: inline-flex; align-items: center; gap: 8px;
+  border: 0; background: transparent; color: var(--text); font: inherit;
+  font-size: 13px; font-weight: 600; padding: 4px 8px; border-radius: 8px; cursor: pointer;
+}
+.tl-group-toggle:hover { background: var(--bg-hover); }
+.tl-group-toggle:focus-visible { outline: none; box-shadow: var(--ring); }
+.tl-group-toggle .icon { width: 14px; height: 14px; color: var(--text-dim); }
+.tl-group-toggle .dot { width: 8px; height: 8px; border-radius: 50%; }
+.tl-group-toggle .count {
+  font-weight: 500; font-variant-numeric: tabular-nums; color: var(--text-dim); font-size: 11.5px;
+  min-width: 22px; padding: 1px 8px; border-radius: var(--radius-pill); background: var(--bg-raised); text-align: center;
+}
+
+.tl-row { cursor: pointer; }
+.tl-row td {
+  padding: 8px 10px; vertical-align: middle;
+  border-bottom: 1px solid var(--hairline);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tl-row:hover td { background: var(--bg-hover); }
+.tl-row:focus-visible { outline: none; }
+.tl-row:focus-visible td { background: var(--accent-soft); }
+.tl-row:focus-visible td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.tl-row.live td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.tl-row.failed td:first-child { box-shadow: inset 3px 0 0 var(--red); }
+.tl-title-cell { white-space: normal !important; }
+.tl-title { font-weight: 500; overflow-wrap: anywhere; }
+.tl-flags { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 8px; vertical-align: 1px; }
+.tl-error { display: block; margin-top: 2px; font-size: 11.5px; color: var(--red); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-agent { display: inline-flex; align-items: center; gap: 4px; margin-right: 6px; font-size: 12px; font-weight: 600; }
+.tl-agent .icon, .tl-branch .icon { width: 13px; height: 13px; }
+.tl-branch { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 11.5px; color: var(--green); max-width: 100%; }
+.tl-dim { color: var(--text-dim); }
+.tl-num, .tl-time { font-variant-numeric: tabular-nums; }
+.tl-time { color: var(--text-dim); font-size: 12px; }
+.tl-none { color: var(--text-dim); opacity: .6; }
+.tl-col-actions { text-align: right; }
+.tl-live { display: inline-flex; align-items: center; gap: 6px; margin-right: 2px; font-size: 11.5px; color: var(--text-dim); vertical-align: middle; }
+.tl-live .spinner { width: 10px; height: 10px; border-width: 1.5px; }
+.tl-live .live-label { font-size: 11px; font-weight: 600; color: var(--groom); }
+.tl-act { min-height: 26px; padding: 3px 6px; color: var(--text-dim); }
+.tl-act .icon { width: 14px; height: 14px; }
+.tl-act:hover { color: var(--text); }
+/* Quiet until the row is in play, like a card's terminal button. The stop
+   button stays visible: a live run is the one thing you may need to halt. */
+.tl-row .tl-act:not(.danger) { opacity: .4; transition: opacity .12s; }
+.tl-row:hover .tl-act, .tl-row:focus-within .tl-act, .tl-act:focus-visible { opacity: 1; }
+.tl-empty {
+  color: var(--text-dim); font-size: 13px; text-align: center; padding: 48px 12px;
+  border: 1.5px dashed var(--border); border-radius: var(--radius-md); margin: 12px 0;
+}
+.tl-empty .icon { width: 13px; height: 13px; vertical-align: -2px; }
+/* Narrow windows keep what identifies a row and drop what compares rows. */
+@media (max-width: 1100px) {
+  .task-list .tl-col-branch, .task-list .tl-col-grade { display: none; }
+}
+@media (max-width: 760px) {
+  .task-list .tl-col-agent, .task-list .tl-col-updated { display: none; }
+  .view-toggle-btn .btn-label { display: none; }
+}
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
 /* ── cards ── */
 .card {
   background: var(--bg-card); border: 1px solid var(--hairline); border-radius: var(--radius-md);
