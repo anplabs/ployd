@@ -15,7 +15,13 @@ import { loadUsage, usageRepoOptionsHtml } from './usage.js';
 // ---------- settings modal ----------
 function showSettingsSection(name) {
   for (const item of document.querySelectorAll('.settings-nav-item')) {
-    item.classList.toggle('active', item.dataset.section === name);
+    const on = item.dataset.section === name;
+    item.classList.toggle('active', on);
+    if (on) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+    // The content pane's fixed header names the open section, so the title
+    // sits in one place instead of scrolling away with each section's body.
+    if (on) $('#settings-section-title').textContent = item.textContent.trim();
   }
   for (const sec of document.querySelectorAll('.settings-section')) {
     sec.classList.toggle('hidden', sec.dataset.section !== name);
@@ -90,13 +96,13 @@ function renderEditorSetting() {
   }
   sel.value = current;
   // Warn when the chosen editor isn't installed here — otherwise clicking
-  // "Open in IDE" would just toast an error with no hint of why. The note goes
-  // after the <label>, not inside it (a <p> isn't valid label content).
+  // "Open in IDE" would just toast an error with no hint of why. The note joins
+  // the row's description, under the label it explains.
   $('#setting-editor-missing')?.remove();
   const chosen = editorById(current);
   if (chosen && !chosen.available) {
-    sel.closest('label').insertAdjacentHTML('afterend',
-      `<p class="addon-hint warn" id="setting-editor-missing">${icon('triangle-alert')} <span>${esc(chosen.label)} isn't on this machine yet. ${esc(chosen.hint)}</span></p>`);
+    sel.closest('.settings-row').querySelector('.settings-row-text').insertAdjacentHTML('beforeend',
+      `<p class="settings-row-desc warn" id="setting-editor-missing">${icon('triangle-alert')} <span>${esc(chosen.label)} isn't on this machine yet. ${esc(chosen.hint)}</span></p>`);
   }
 }
 

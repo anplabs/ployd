@@ -771,7 +771,7 @@ what that costs: `server/resources.ts` samples the OS process table and reports 
 memory for **this app** and for **each live agent session**, attributed per
 task/grooming/orchestration/ask card.
 
-- **Opt-in.** `Settings > resourceMonitor` (Settings → General → Resource monitor,
+- **Opt-in.** `Settings > resourceMonitor` (Settings → General → Performance → Resource monitor,
   default **off**). Nothing is sampled while it's off — `GET /api/resources` answers
   `{ enabled: false }` rather than an error, which is also what tells the board to hide
   its chip. Turning it off calls `resources.reset()` so a re-enable starts from a clean
@@ -803,7 +803,7 @@ Running many agents at once is the point, so a single session must not be free t
 grow into the whole machine. Two controls in `server/agents/claude.ts` bound what
 one `claude` child costs; both apply to *every* Claude session (dispatch, grooming,
 Code Review, orchestration, memory distillation, Ask), and both are in Settings →
-General → Concurrency / Agent isolation.
+General → Performance.
 
 - **Per-session memory budget** (`Settings.sessionMemoryMb`, default `'auto'`).
   The `claude` CLI ships as a **Bun/JavaScriptCore binary, not Node** — `NODE_OPTIONS`
