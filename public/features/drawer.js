@@ -4,6 +4,7 @@ import { $, state } from '../core/state.js';
 import { renderDrawerHead, renderGroomingDrawerHead, renderOrchestrationDrawerHead } from './context-menu.js';
 import { renderPermissionPrompts } from './permissions.js';
 import { appendEvent, refreshPr, refreshRepoBranchForTask, scrollTimeline } from './pr.js';
+import { markSeen } from './sidebar.js';
 
 
 // ---------- drawer / timeline ----------
@@ -15,6 +16,12 @@ const timeline = {
   stream: null,
 };
 
+// The card the drawer is about to stop showing — closed, or swapped for another
+// one — counts as seen, which moves a finished run out of the rail's Done group.
+function leaveOpenItem() {
+  markSeen(state.openTaskId || state.openGroomingId || state.openOrchestrationId);
+}
+
 // Drop the per-session render state before (re)playing a timeline, so a drawer
 // never folds new events into the previous session's elements.
 function resetTimelineState() {
@@ -24,6 +31,7 @@ function resetTimelineState() {
 }
 
 async function openDrawer(taskId) {
+  leaveOpenItem();
   state.openTaskId = taskId;
   state.openGroomingId = null;
   state.openOrchestrationId = null;
@@ -48,6 +56,7 @@ async function openDrawer(taskId) {
 // The same drawer, showing a grooming card: its idea, the read-only session's
 // timeline, and (once finished) the tasks it spawned.
 async function openGroomingDrawer(groomingId) {
+  leaveOpenItem();
   state.openTaskId = null;
   state.openGroomingId = groomingId;
   state.openOrchestrationId = null;
@@ -71,6 +80,7 @@ async function openGroomingDrawer(groomingId) {
 // session's timeline, the worker tasks it spawned, and (when it asked
 // something) a reply box.
 async function openOrchestrationDrawer(orchestrationId) {
+  leaveOpenItem();
   state.openTaskId = null;
   state.openGroomingId = null;
   state.openOrchestrationId = orchestrationId;
@@ -91,6 +101,7 @@ async function openOrchestrationDrawer(orchestrationId) {
 }
 
 function closeDrawer() {
+  leaveOpenItem();
   state.openTaskId = null;
   state.openGroomingId = null;
   state.openOrchestrationId = null;

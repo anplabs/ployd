@@ -856,132 +856,171 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; padding: 0 10px 
 .worktree-row .btn { flex: none; padding: 5px 9px; font-size: 11px; min-height: 26px; }
 
 /* ── project sidebar ("sidebar" layout) ──
-   Settings → General → Appearance → Layout. A persistent rail of every
-   repository with its cards grouped by board column, sitting left of the same
-   Super View / board the classic layout shows. Styled after a shadcn sidebar:
-   a flat surface, uppercase group labels, rounded hover rows, one accent for
-   what's in focus. `hidden` (classic layout) removes it entirely. */
+   Settings → General → Appearance → Layout. Two sections, after herdr's
+   "the sidebar shows which one needs you": Agents (only what is waiting on
+   you, running, or finished and unseen, across every project) and Projects
+   (one row per repo with its branch, rolled-up status and terminal sessions).
+   A flat surface, small section labels, rounded hover rows, one soft filled
+   row for what's in focus. `hidden` (classic layout) removes it entirely. */
 .sidebar {
   flex: none; width: 264px; min-width: 264px;
-  display: flex; flex-direction: column; gap: 2px;
+  display: flex; flex-direction: column; gap: 14px;
   /* No left padding: <main> already insets the rail from the window edge. */
   padding: 2px 10px 12px 0;
   background: transparent;
   overflow-y: auto;
 }
-.sidebar-head {
-  display: flex; align-items: center; gap: 8px; padding: 2px 4px 8px 10px;
+.sidebar .count {
+  margin-left: auto; font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums;
 }
-.sidebar-head-title {
-  font-size: 12px; font-weight: 600;
-  color: var(--text-dim); flex: 1;
-}
-.sidebar-head .btn { padding: 4px 6px; min-height: 26px; box-shadow: none; }
-/* Same fixed-width single-icon shape as #workspace-back/#workspace-more —
-   padding-driven width left it a slightly-off, non-square button. */
-#sidebar-add-repo { width: 26px; height: 26px; padding: 0; border-radius: var(--radius-pill); }
+.sidebar .icon { width: 15px; height: 15px; flex: none; }
+.sidebar-avatar { width: 18px; height: 18px; border-radius: 5px; flex: none; }
+.sidebar-project-icon { display: inline-flex; color: var(--text-dim); flex: none; }
+.sidebar-empty { padding: 4px 10px 6px; font-size: 12px; line-height: 1.45; color: var(--text-dim); opacity: .8; }
 
-/* Rows — the "All projects" entry, each project, and each card — share one
-   shape so the rail reads as a single list at three depths. */
-.sidebar-super, .sidebar-org-btn, .sidebar-project-btn, .sidebar-card {
-  display: flex; align-items: center; gap: 9px; width: 100%;
+/* Every clickable row shares one shape so the rail reads as a single list. */
+.sb-home, .sb-agent, .sb-project-btn, .sb-org-btn, .sb-session {
+  display: flex; align-items: center; gap: 9px; width: 100%; min-width: 0;
   padding: 7px 10px; border-radius: var(--radius-sm); cursor: pointer;
   background: transparent; border: 1px solid transparent; color: var(--text);
   font: inherit; font-size: 13.5px; text-align: left;
   transition: background .12s var(--ease), color .12s var(--ease);
 }
-.sidebar-super:hover, .sidebar-org-btn:hover, .sidebar-project-btn:hover, .sidebar-card:hover { background: var(--bg-hover); }
-.sidebar-super:focus-visible, .sidebar-org-btn:focus-visible, .sidebar-project-btn:focus-visible,
-.sidebar-card:focus-visible, .sidebar-twisty:focus-visible {
+.sb-home:hover, .sb-agent:hover, .sb-project-btn:hover, .sb-org-btn:hover, .sb-session:hover { background: var(--bg-hover); }
+.sb-home:focus-visible, .sb-agent:focus-visible, .sb-project-btn:focus-visible, .sb-org-btn:focus-visible,
+.sb-session:focus-visible, .sb-project-add:focus-visible, .sb-section-add:focus-visible, .sb-group-action:focus-visible {
   outline: none; box-shadow: var(--ring);
 }
-.sidebar .count {
-  margin-left: auto; font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums;
+/* What's in focus — the tab in front, or the card whose drawer is open — is a
+   soft filled row, the selection style every modern rail uses. */
+.sb-home.active, .sb-agent.active, .sb-project-row.active, .sb-session.active {
+  background: var(--bg-card); border-color: var(--hairline); box-shadow: var(--shadow-sm);
 }
-.sidebar .icon { width: 15px; height: 15px; flex: none; }
-.sidebar-super { margin-bottom: 8px; }
-/* What's in focus is a soft filled row, the selection style every modern rail
-   uses — the accent is kept for the label, not a whole tinted block. */
-.sidebar-super.active { background: var(--bg-card); color: var(--text); font-weight: 600; box-shadow: var(--shadow-sm); border-color: var(--hairline); }
-.sidebar-super.active .icon { color: var(--accent); }
+.sb-home.active { font-weight: 600; }
+.sb-home.active .icon { color: var(--accent); }
 
-.sidebar-projects { display: flex; flex-direction: column; gap: 2px; }
+/* Section = a small label with an optional action, then its rows. */
+.sb-section { display: flex; flex-direction: column; gap: 2px; }
+.sb-section-head { display: flex; align-items: center; gap: 8px; min-height: 26px; padding: 0 4px 2px 10px; }
+.sb-section-title { flex: 1; font-size: 12px; font-weight: 600; color: var(--text-dim); }
+.sb-section-add {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 24px; height: 24px; padding: 0; border: none; border-radius: var(--radius-pill);
+  background: transparent; color: var(--text-dim); cursor: pointer;
+}
+.sb-section-add:hover { background: var(--bg-hover); color: var(--text); }
+.sb-section-add .icon { width: 14px; height: 14px; }
+
+/* An Agents group: Needs you / Working / Done. */
+.sb-group { display: flex; flex-direction: column; gap: 1px; }
+.sb-group + .sb-group { margin-top: 6px; }
+.sb-group-head {
+  display: flex; align-items: center; gap: 6px; padding: 2px 10px;
+  font-size: 11px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase; color: var(--text-dim);
+}
+.sb-group-needs .sb-group-label { color: var(--conflict); }
+.sb-group-head .count { margin-left: 0; }
+.sb-group-action {
+  margin-left: auto; padding: 1px 7px; border: none; border-radius: var(--radius-pill);
+  background: transparent; color: var(--text-dim); cursor: pointer;
+  font: inherit; font-size: 11px; font-weight: 500; letter-spacing: 0; text-transform: none;
+}
+.sb-group-action:hover { background: var(--bg-hover); color: var(--text); }
+
+/* Status glyph. Working spins, Needs you is a filled amber ring that breathes,
+   Done is a solid dot (red when the run failed), idle a hollow ring. */
+.sb-glyph {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 12px; height: 12px; border-radius: 50%;
+}
+.sb-glyph.working .spinner { width: 10px; height: 10px; border-width: 1.5px; }
+.sb-glyph.needs {
+  width: 10px; height: 10px; background: var(--conflict);
+  box-shadow: 0 0 0 3px var(--conflict-soft);
+  animation: sb-breathe 1.8s ease-in-out infinite;
+}
+.sb-glyph.done { width: 8px; height: 8px; background: var(--green); }
+.sb-glyph.done.failed { background: var(--red); }
+.sb-glyph.idle { width: 8px; height: 8px; border: 1.5px solid var(--text-dim); opacity: .45; }
+@keyframes sb-breathe { 0%, 100% { box-shadow: 0 0 0 3px var(--conflict-soft); } 50% { box-shadow: 0 0 0 1px var(--conflict-soft); } }
+@media (prefers-reduced-motion: reduce) { .sb-glyph.needs { animation: none; } }
+
+/* An agent row: glyph, then title over "project · state · agent". */
+.sb-agent { align-items: flex-start; padding: 6px 10px; }
+.sb-agent .sb-glyph { margin-top: 3px; }
+.sb-agent-text { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+.sb-agent-title, .sb-agent-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-agent-title { font-size: 13px; line-height: 1.35; }
+.sb-agent-meta { font-size: 11.5px; line-height: 1.35; color: var(--text-dim); }
+.sb-agent-meta.needs { color: var(--conflict); }
+.sb-agent-meta.failed { color: var(--red); }
+.sb-agent-when { flex: none; margin-top: 2px; font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+
+/* A project row: the board button, plus a terminal button that shows on hover. */
+.sb-project { display: flex; flex-direction: column; gap: 1px; }
+.sb-project-row { display: flex; align-items: center; border-radius: var(--radius-sm); border: 1px solid transparent; }
+.sb-project-row.active .sb-project-btn:hover { background: transparent; }
+.sb-project-row.active .sb-project-name { font-weight: 600; }
+.sb-project-btn { flex: 1; gap: 8px; }
+/* The branch gives way first: the name keeps its width (up to most of the row)
+   and the branch fills whatever is left, truncating as it goes. */
+.sb-project-name { flex: none; max-width: 72%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-project-branch {
+  flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+}
+.sb-project-status { display: inline-flex; align-items: center; gap: 4px; flex: none; margin-left: auto; }
+.sb-pill {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 6px; border-radius: var(--radius-pill);
+  font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.sb-pill.needs { color: var(--conflict); background: var(--conflict-soft); }
+.sb-pill.working { color: var(--accent); background: var(--accent-soft); }
+.sb-project-add {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 24px; height: 24px; margin-right: 4px; padding: 0; border: none; border-radius: var(--radius-pill);
+  background: transparent; color: var(--text-dim); cursor: pointer; opacity: 0;
+  transition: opacity .12s var(--ease);
+}
+.sb-project-row:hover .sb-project-add, .sb-project-add:focus-visible { opacity: 1; }
+.sb-project-add:hover { background: var(--bg-hover); color: var(--text); }
+.sb-project-add .icon { width: 13px; height: 13px; }
+/* Touch screens have no hover to reveal it. */
+@media (hover: none) { .sb-project-add { opacity: 1; } }
+
+/* A project's terminal sessions, nested like tabs under a space. */
+.sb-sessions {
+  display: flex; flex-direction: column; gap: 1px;
+  margin: 0 0 4px 18px; padding-left: 6px; border-left: 1px solid var(--hairline);
+}
+.sb-session { font-size: 12.5px; padding: 5px 10px; color: var(--text-dim); gap: 8px; }
+.sb-session:hover, .sb-session.active { color: var(--text); }
+.sb-session-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-session-note { flex: none; font-size: 11px; color: var(--text-dim); }
+
 /* Repos sharing an `origin` owner (anplabs/intranet, anplabs/platform) sit under
    one org heading. It only folds the group — an org is not a workspace you can
-   enter — so it reads as a lighter, wider row than a project. */
-.sidebar-org { display: flex; flex-direction: column; gap: 2px; }
-.sidebar-org-btn { min-width: 0; gap: 6px; }
-.sidebar-org-twisty { display: inline-flex; color: var(--text-dim); flex: none; }
-.sidebar-org-twisty .icon { width: 13px; height: 13px; }
-.sidebar-org-name {
+   enter — so it reads as a lighter row than a project. */
+.sb-org { display: flex; flex-direction: column; gap: 1px; }
+.sb-org-btn { gap: 6px; }
+.sb-org-twisty { display: inline-flex; color: var(--text-dim); flex: none; }
+.sb-org-twisty .icon { width: 13px; height: 13px; }
+.sb-org-name {
   font-weight: 600; color: var(--text-dim);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.sidebar-org-btn:hover .sidebar-org-name { color: var(--text); }
-.sidebar-org-btn .running-badge { margin-left: auto; font-size: 10px; padding: 1px 7px; gap: 4px; flex: none; }
-/* Shallower than the project→cards indent: the rail is 264px wide and a card
-   inside a project inside an org is already three levels deep. */
-.sidebar-org-body {
-  display: flex; flex-direction: column; gap: 2px;
-  margin: 2px 0 4px 11px; padding-left: 6px; border-left: 1px solid var(--hairline);
+.sb-org-btn:hover .sb-org-name { color: var(--text); }
+.sb-org-btn .sb-glyph { margin-left: auto; }
+.sb-org-body {
+  display: flex; flex-direction: column; gap: 1px;
+  margin: 1px 0 4px 11px; padding-left: 6px; border-left: 1px solid var(--hairline);
 }
-.sidebar-project-head { display: flex; align-items: center; gap: 2px; border-radius: var(--radius-sm); border: 1px solid transparent; }
-.sidebar-project-head.active { background: var(--bg-card); border-color: var(--hairline); box-shadow: var(--shadow-sm); }
-.sidebar-project-head.active .sidebar-project-name { color: var(--text); font-weight: 600; }
-.sidebar-project-head.active .sidebar-project-btn:hover { background: transparent; }
-.sidebar-twisty {
-  flex: none; display: inline-flex; align-items: center; justify-content: center;
-  width: 22px; height: 26px; padding: 0; border: none; border-radius: var(--radius-xs);
-  background: transparent; color: var(--text-dim); cursor: pointer;
-}
-.sidebar-twisty:hover { color: var(--text); }
-.sidebar-twisty .icon { width: 13px; height: 13px; }
-.sidebar-project-btn { min-width: 0; }
-.sidebar-project-icon { display: inline-flex; color: var(--text-dim); flex: none; }
-.sidebar-avatar { width: 18px; height: 18px; border-radius: 5px; flex: none; }
-.sidebar-project-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar-project-btn .running-badge {
-  margin-left: auto; font-size: 10px; padding: 1px 7px; gap: 4px; flex: none;
-}
-.sidebar-project-body {
-  display: flex; flex-direction: column; gap: 8px;
-  margin: 6px 0 10px 14px; padding-left: 8px; border-left: 1px solid var(--hairline);
-}
-.sidebar-divider { height: 1px; margin: 0 8px; background: var(--hairline); }
-.sidebar-group { display: flex; flex-direction: column; gap: 1px; }
-.sidebar-group-head {
-  display: flex; align-items: center; gap: 6px; padding: 2px 10px;
-  font-size: 11.5px; font-weight: 600;
-  color: var(--text-dim);
-}
-.sidebar-group-head .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
-.sidebar-group-head .icon { width: 12px; height: 12px; }
-/* The Sessions group's heading carries the "new session" +, so the row is the
-   one place in the rail that does something other than navigate. */
-.sidebar-group-add {
-  flex: none; display: inline-flex; align-items: center; justify-content: center;
-  width: 20px; height: 20px; margin-left: 4px; padding: 0; border: none; border-radius: var(--radius-pill);
-  background: transparent; color: var(--text-dim); cursor: pointer;
-}
-.sidebar-group-add:hover { background: var(--bg-hover); color: var(--text); }
-.sidebar-group-add:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
-.sidebar-group-add .icon { width: 12px; height: 12px; }
-.sidebar-session .sidebar-card-badge { color: var(--text-dim); }
-.sidebar-card { font-size: 13px; padding: 6px 10px; color: var(--text-dim); }
-.sidebar-card:hover { color: var(--text); }
-.sidebar-card-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; opacity: .85; }
-.sidebar-card-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar-card .spinner { width: 9px; height: 9px; border-width: 1.5px; flex: none; }
-.sidebar-card-badge {
-  flex: none; font-size: 10px; font-weight: 600;
-  padding: 1px 7px; border-radius: var(--radius-pill);
-  color: var(--accent); background: var(--accent-soft);
-}
-.sidebar-empty { padding: 8px 10px; font-size: 12px; color: var(--text-dim); opacity: .7; }
-/* The overflow row of a truncated group — reads as a link, not another card. */
+
+/* The overflow row of a truncated group — reads as a link, not another row. */
 .sidebar-more {
   display: flex; align-items: center; gap: 6px; width: 100%;
-  padding: 6px 10px; border: 0; border-radius: var(--radius-sm); background: none; cursor: pointer;
+  padding: 5px 10px; border: 0; border-radius: var(--radius-sm); background: none; cursor: pointer;
   font: inherit; font-size: 12px; color: var(--text-dim); text-align: left;
 }
 .sidebar-more:hover { background: var(--bg-hover); color: var(--text); }

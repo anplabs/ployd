@@ -1,48 +1,255 @@
 /* Ployd — sidebar. No build step: native ES module. */
-import { esc } from '../core/api.js';
-import { $, COLUMNS, COLUMN_OF_STATUS, GROOMING_COLUMN, ORCH_COLUMN, icon, isGroomingLive, isLive, isOrchestrationLive, pendingPermissions, state } from '../core/state.js';
+import { agentBadge, esc, relativeTime } from '../core/api.js';
+import { $, icon, isGroomingLive, isOrchestrationLive, pendingPermissions, state } from '../core/state.js';
 import { openContextMenu } from './context-menu.js';
 import { openDrawer, openGroomingDrawer, openOrchestrationDrawer } from './drawer.js';
-import { filtersActive, groomingMatchesFilters, groomingsForRepo, orchestrationMatchesFilters, orchestrationsForRepo, taskMatchesFilters, tasksForRepo } from './filters.js';
 import { openReposModal } from './repos-modal.js';
+import { activeTabKey } from './tabs.js';
 import { STATUS_LABEL, focusSession, openNewSessionMenu, sessionsForRepo } from './terminal.js';
 import { currentLayout } from './theme.js';
 import { enterWorkspace, exitWorkspace, githubAvatarUrl, refreshRepoBranchCard } from './workspaces.js';
 
 
 // ---------- project sidebar ("sidebar" layout) ----------
-// The alternate shell chosen in Settings → General → Appearance → Layout: a
-// persistent left rail listing every repository with its cards grouped by
-// board column, next to the same Super View / board the classic layout shows.
-// It is pure navigation — clicking a project switches workspace, clicking a
-// card opens the same drawer — so nothing here can change a task's state.
-// Renders only while the layout is on; in the classic layout it's a no-op.
+// The rail answers one question first: which agent needs me? It used to list
+// every card of every project grouped by board column, which made it a second,
+// cramped board you had to read top to bottom. Now it has two sections, after
+// herdr's "a space per repo, and the sidebar shows which one needs you":
+//
+//   Agents   — only the work that is in motion or waiting on you, across every
+//              project, sorted by urgency: Needs you > Working > Done (finished
+//              and not looked at yet). Everything else lives on the board.
+//   Projects — one row per repo (its branch and a rolled-up status), with the
+//              repo's terminal sessions nested under it like tabs.
+//
+// It is pure navigation — clicking a row opens the drawer, the board or the
+// shell — so nothing here can change a task's state. The only thing it creates
+// is a terminal session. Renders only while the layout is on.
 
-// Repos whose card list is unfolded. Kept in memory (not localStorage) like
-// the rest of the board's transient UI state, so a re-render preserves it but
-// a reload starts from the current workspace again.
-const sidebarExpanded = new Set();
+// How many rows an Agents group or a project's session list shows before it
+// truncates. The overflow row expands in place, since an Agents group spans
+// projects and has no single board to send you to.
+const SIDEBAR_MAX_ROWS = 5;
+// Groups the user unfolded past the cap, by key ('needs' | 'working' | 'done' |
+// `sessions:<repoId>`). In memory like the rest of the board's transient UI.
+const expandedGroups = new Set();
 // Organization groups the user folded away, by org key. Inverted on purpose
 // (collapsed rather than expanded): a group is open until you close it, so
 // grouping never hides a project you could see before.
 const sidebarOrgCollapsed = new Set();
-// The first render unfolds whichever workspace was restored from localStorage
-// (entering one later does it in enterWorkspace). One-shot, so collapsing that
-// project again isn't undone by the next SSE tick.
-let sidebarSeeded = false;
-
-// How many rows a group shows before it truncates. A busy project has dozens of
-// cards; listing them all turns the rail into a second board you have to scroll
-// past to reach the next project. The overflow row is the way out: for cards it
-// opens that project's board (where everything is visible, in columns), which is
-// the surface that's actually built for reading them.
-const SIDEBAR_MAX_ROWS = 5;
-// Sessions have no column and no board, so theirs expands in place instead.
-// Per repo, in memory like `sidebarExpanded`.
-const sidebarSessionsExpanded = new Set();
 
 const sidebarOn = () => currentLayout() === 'sidebar';
 
+// ---- "seen": herdr's done vs idle ----
+// A finished run stays in Done until you open it; after that it's idle and
+// leaves the rail (it's still on the board). Stored per device next to the
+// theme and the tabs, keyed by card id, as the `finishedAt` you saw — a new run
+// stamps a new one, so the card comes back when it finishes again.
+const SEEN_KEY = 'ployd.sidebarSeen';
+let seen = null; // id -> finishedAt (or updatedAt when a card has none)
+
+const finishStamp = (item) => item.finishedAt || item.updatedAt || '';
+
+function loadSeen() {
+  try {
+    const raw = localStorage.getItem(SEEN_KEY);
+    if (raw) return JSON.parse(raw) || {};
+  } catch { /* malformed or unavailable storage: start over */ }
+  return null;
+}
+function saveSeen() {
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch { /* non-fatal */ }
+}
+// Every finished card that exists right now, keyed for the seen map.
+function finishedItems() {
+  return [
+    ...[...state.tasks.values()].filter((t) => t.status === 'validation' || t.status === 'failed'),
+    ...[...state.groomings.values()].filter((g) => g.status === 'finished' || g.status === 'failed'),
+    ...[...state.orchestrations.values()].filter((o) => o.status === 'finished' || o.status === 'failed'),
+  ];
+}
+// The first time the rail runs on a device there is no history, and every card
+// already in Validation would show up as "Done". Treat what exists at that
+// moment as seen, so Done starts empty and fills only with new results.
+function ensureSeen() {
+  if (seen) return true;
+  seen = loadSeen();
+  if (seen) return true;
+  // Wait for the first render that has data — boot() applies the layout before
+  // any state is loaded, and seeding from that empty pass would seed nothing.
+  if (!state.repos.length) { seen = null; return false; }
+  seen = {};
+  for (const item of finishedItems()) seen[item.id] = finishStamp(item);
+  saveSeen();
+  return true;
+}
+const isUnseen = (item) => !!seen && seen[item.id] !== finishStamp(item);
+
+// Called by the drawer when it stops showing a card (closed, or switched to
+// another one): whatever result you were looking at counts as seen. Marked on
+// leave rather than on open, so the row you clicked doesn't vanish under the
+// cursor while its drawer is still open.
+function markSeen(id) {
+  if (!id || !ensureSeen()) return;
+  const item = state.tasks.get(id) || state.groomings.get(id) || state.orchestrations.get(id);
+  if (!item) return;
+  seen[item.id] = finishStamp(item);
+  // Drop ids for cards that no longer exist, so the map can't grow forever.
+  for (const key of Object.keys(seen)) {
+    if (!state.tasks.has(key) && !state.groomings.has(key) && !state.orchestrations.has(key)) delete seen[key];
+  }
+  saveSeen();
+  renderSidebar();
+}
+// "Clear" on the Done heading: everything finished so far is seen.
+function markAllSeen() {
+  if (!ensureSeen()) return;
+  for (const item of finishedItems()) seen[item.id] = finishStamp(item);
+  saveSeen();
+  renderSidebar();
+}
+
+// ---- agent state ----
+// One shape for tasks, groomings and orchestrations, so the rail can sort and
+// render them together. `state` is herdr's vocabulary: 'needs' (blocked on you),
+// 'working', 'done' (finished, unseen) — or null when the card is just sitting
+// on the board and has no business in the rail.
+const repoName = (repoId) => state.repos.find((r) => r.id === repoId)?.name || '';
+
+function taskAgent(t) {
+  const asks = pendingPermissions(t.id).length;
+  let st = null, label = '';
+  if (asks) { st = 'needs'; label = `${asks} approval${asks === 1 ? '' : 's'}`; }
+  else if (t.status === 'running') { st = 'working'; label = 'running'; }
+  else if (t.status === 'code_review') { st = 'working'; label = 'code review'; }
+  else if (t.status === 'failed' && isUnseen(t)) { st = 'done'; label = 'failed'; }
+  else if (t.status === 'validation' && isUnseen(t)) { st = 'done'; label = 'to validate'; }
+  if (!st) return null;
+  const badge = agentBadge(t);
+  return {
+    kind: 'task', id: t.id, title: t.title, repoId: t.repoId, state: st, label,
+    failed: t.status === 'failed', agent: badge ? badge.label : '', at: t.finishedAt || t.updatedAt,
+  };
+}
+
+function groomingAgent(g) {
+  let st = null, label = '';
+  if (g.status === 'awaiting') { st = 'needs'; label = 'has questions'; }
+  else if (isGroomingLive(g)) { st = 'working'; label = 'grooming'; }
+  else if ((g.status === 'finished' || g.status === 'failed') && isUnseen(g)) {
+    st = 'done'; label = g.status === 'failed' ? 'grooming failed' : 'groomed';
+  }
+  if (!st) return null;
+  return { kind: 'grooming', id: g.id, title: g.title, repoId: g.repoId, state: st, label, failed: g.status === 'failed', at: g.finishedAt || g.updatedAt };
+}
+
+function orchestrationAgent(o) {
+  let st = null, label = '';
+  if (o.status === 'awaiting') { st = 'needs'; label = 'has a question'; }
+  else if (isOrchestrationLive(o)) { st = 'working'; label = 'planning'; }
+  else if (o.status === 'waiting') { st = 'working'; label = 'waiting on workers'; }
+  else if ((o.status === 'finished' || o.status === 'failed') && isUnseen(o)) {
+    st = 'done'; label = o.status === 'failed' ? 'goal failed' : 'goal reached';
+  }
+  if (!st) return null;
+  return { kind: 'orchestration', id: o.id, title: o.title, repoId: o.repoId, state: st, label, failed: o.status === 'failed', at: o.finishedAt || o.updatedAt };
+}
+
+function allAgents() {
+  return [
+    ...[...state.tasks.values()].map(taskAgent),
+    ...[...state.groomings.values()].map(groomingAgent),
+    ...[...state.orchestrations.values()].map(orchestrationAgent),
+  ].filter(Boolean);
+}
+
+const STATE_RANK = { needs: 0, working: 1, done: 2 };
+// A project's status is its most urgent agent, the way a herdr space rolls up.
+function rollup(agents) {
+  let best = null;
+  for (const a of agents) if (!best || STATE_RANK[a.state] < STATE_RANK[best]) best = a.state;
+  return best;
+}
+
+// The status glyph every row leads with. Spinner while working, a filled amber
+// ring when it's waiting on you, a dot when done (red if it failed), and a
+// hollow ring for "nothing going on".
+function glyph(st, failed) {
+  if (st === 'working') return '<span class="sb-glyph working"><span class="spinner"></span></span>';
+  if (st === 'needs') return '<span class="sb-glyph needs" aria-hidden="true"></span>';
+  if (st === 'done') return `<span class="sb-glyph done${failed ? ' failed' : ''}" aria-hidden="true"></span>`;
+  return '<span class="sb-glyph idle" aria-hidden="true"></span>';
+}
+const STATE_TEXT = { needs: 'Needs you', working: 'Working', done: 'Done' };
+
+// ---- Agents section ----
+function openItemId() {
+  return state.openTaskId || state.openGroomingId || state.openOrchestrationId;
+}
+
+// Two lines, like herdr's "herdr · working · claude": the card's title, then
+// where it lives and what it's doing. The project name is what lets one list
+// span every repo without losing track of which is which.
+function agentRowHtml(a) {
+  const meta = [repoName(a.repoId), a.label, a.agent].filter(Boolean).join(' · ');
+  const when = a.state === 'done' && a.at ? relativeTime(a.at) : '';
+  const active = openItemId() === a.id;
+  return `
+      <button class="sb-agent${active ? ' active' : ''}" data-${a.kind}="${esc(a.id)}"
+              title="${esc(`${a.title}\n${meta}`)}">
+        ${glyph(a.state, a.failed)}
+        <span class="sb-agent-text">
+          <span class="sb-agent-title">${esc(a.title)}</span>
+          <span class="sb-agent-meta${a.state === 'needs' ? ' needs' : ''}${a.failed ? ' failed' : ''}">${esc(meta)}</span>
+        </span>
+        ${when ? `<span class="sb-agent-when">${esc(when)}</span>` : ''}
+      </button>`;
+}
+
+function moreRowHtml(key, total) {
+  const all = expandedGroups.has(key);
+  return `
+      <button class="sidebar-more" data-more="${esc(key)}">
+        ${icon(all ? 'chevron-up' : 'chevron-down')}
+        <span>${all ? 'Show less' : `Show ${total - SIDEBAR_MAX_ROWS} more`}</span>
+      </button>`;
+}
+
+function agentsSectionHtml(agents) {
+  const groups = ['needs', 'working', 'done'].map((st) => ({
+    st,
+    rows: agents.filter((a) => a.state === st)
+      // Most recent first within a group: the newest result, the run that just
+      // started, the question that just came in.
+      .sort((a, b) => (b.at || '').localeCompare(a.at || '')),
+  })).filter((g) => g.rows.length);
+
+  const body = groups.length
+    ? groups.map(({ st, rows }) => {
+      const shown = expandedGroups.has(st) ? rows : rows.slice(0, SIDEBAR_MAX_ROWS);
+      return `
+      <div class="sb-group sb-group-${st}">
+        <div class="sb-group-head">
+          <span class="sb-group-label">${STATE_TEXT[st]}</span>
+          <span class="count">${rows.length}</span>
+          ${st === 'done'
+          ? '<button class="sb-group-action" data-seen-all="1" title="Mark every finished run as seen">Clear</button>'
+          : ''}
+        </div>
+        ${shown.map(agentRowHtml).join('')}
+        ${rows.length > SIDEBAR_MAX_ROWS ? moreRowHtml(st, rows.length) : ''}
+      </div>`;
+    }).join('')
+    : '<div class="sidebar-empty">No agents running. Queue a task from Home or a project board.</div>';
+
+  return `
+      <section class="sb-section" aria-label="Agents">
+        <div class="sb-section-head"><span class="sb-section-title">Agents</span></div>
+        ${body}
+      </section>`;
+}
+
+// ---- Projects section ----
 // The organization a repo belongs to, read off its `origin` remote — the owner
 // segment of the web URL the server already resolves (`https://host/org/repo`),
 // so `anplabs/intranet` and `anplabs/platform` share one org. Keyed by host too:
@@ -81,213 +288,130 @@ function sidebarOrgEntries(repos) {
   return entries;
 }
 
-// One row per card, in board order: the same status dot, title and live
-// spinner the card shows, compressed to a single line.
-function sidebarCardRow(kind, id, title, dot, live, badge) {
+// A repo's terminal sessions, nested under its row like a herdr space's tabs.
+// Not cards — they have no column and no board state — and clicking one jumps
+// straight into that shell.
+function sessionsHtml(repoId) {
+  const list = sessionsForRepo(repoId);
+  if (!list.length) return '';
+  const key = `sessions:${repoId}`;
+  const shown = expandedGroups.has(key) ? list : list.slice(0, SIDEBAR_MAX_ROWS);
+  const activeKey = activeTabKey();
   return `
-      <button class="sidebar-card" data-${kind}="${esc(id)}" title="${esc(title)}">
-        <span class="sidebar-card-dot" style="background:${dot}"></span>
-        <span class="sidebar-card-title">${esc(title)}</span>
-        ${live ? '<span class="spinner"></span>' : ''}
-        ${badge ? `<span class="sidebar-card-badge">${esc(badge)}</span>` : ''}
-      </button>`;
-}
-
-// Terminal sessions for a repo. Not cards — they have no column and no board
-// state — so they get their own group above the cards, always rendered (even
-// empty) because its heading carries the "new session" button. Clicking a row
-// jumps straight into that shell.
-function sidebarSessionsHtml(repoId) {
-  const rows = sessionsForRepo(repoId).map((s) => `
-      <button class="sidebar-card sidebar-session" data-session="${esc(s.id)}"
-              title="${esc(`${s.label} — ${STATUS_LABEL[s.status]}\n${s.cwd}`)}">
-        <span class="term-dot ${esc(s.status)}"></span>
-        <span class="sidebar-card-title">${esc(s.label)}</span>
-        ${s.status === 'exited' ? '<span class="sidebar-card-badge">closed</span>' : ''}
-      </button>`);
-  const all = sidebarSessionsExpanded.has(repoId);
-  const shown = all ? rows : rows.slice(0, SIDEBAR_MAX_ROWS);
-  const hidden = rows.length - shown.length;
-  return `
-      <div class="sidebar-group">
-        <div class="sidebar-group-head">
-          ${icon('terminal')}
-          <span class="sidebar-group-label">Sessions</span>
-          <span class="count">${rows.length}</span>
-          <button class="sidebar-group-add" data-new-session="${esc(repoId)}"
-                  title="New terminal session" aria-label="New terminal session">${icon('plus')}</button>
-        </div>
-        ${shown.join('') || '<div class="sidebar-empty">no sessions</div>'}
-        ${rows.length > SIDEBAR_MAX_ROWS
-        ? `<button class="sidebar-more" data-more-sessions="${esc(repoId)}">
-             ${icon(all ? 'chevron-up' : 'chevron-down')}
-             <span>${all ? 'Show less' : `Show ${hidden} more`}</span>
-           </button>`
-        : ''}
+      <div class="sb-sessions">
+        ${shown.map((s) => `
+        <button class="sb-session${activeKey === `session:${s.id}` ? ' active' : ''}" data-session="${esc(s.id)}"
+                title="${esc(`${s.label} — ${STATUS_LABEL[s.status]}\n${s.cwd}`)}">
+          <span class="term-dot ${esc(s.status)}"></span>
+          <span class="sb-session-label">${esc(s.label)}</span>
+          ${s.status === 'exited' ? '<span class="sb-session-note">closed</span>' : ''}
+        </button>`).join('')}
+        ${list.length > SIDEBAR_MAX_ROWS ? moreRowHtml(key, list.length) : ''}
       </div>`;
 }
 
-// A repo's cards, grouped by the column they sit in. Empty groups are dropped
-// rather than rendered as six blank headings — the counts live on the group.
-function sidebarGroupsHtml(repoId) {
-  const groups = [];
-
-  const groomings = groomingsForRepo(repoId).filter(groomingMatchesFilters)
-    .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-  if (groomings.length) {
-    groups.push({
-      col: GROOMING_COLUMN,
-      rows: groomings.map((g) => sidebarCardRow('grooming', g.id, g.title, GROOMING_COLUMN.dot,
-        isGroomingLive(g), g.status === 'awaiting' ? 'needs input' : g.status === 'failed' ? 'failed' : '')),
-    });
-  }
-
-  const orchestrations = orchestrationsForRepo(repoId).filter(orchestrationMatchesFilters)
-    .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-  if (orchestrations.length) {
-    groups.push({
-      col: ORCH_COLUMN,
-      rows: orchestrations.map((o) => sidebarCardRow('orchestration', o.id, o.title, ORCH_COLUMN.dot,
-        isOrchestrationLive(o), o.status === 'awaiting' ? 'needs input' : o.status === 'failed' ? 'failed' : '')),
-    });
-  }
-
-  const tasks = tasksForRepo(repoId).filter(taskMatchesFilters);
-  for (const col of COLUMNS) {
-    const inCol = tasks.filter((t) => COLUMN_OF_STATUS[t.status] === col.key)
-      .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-    if (!inCol.length) continue;
-    groups.push({
-      col,
-      rows: inCol.map((t) => sidebarCardRow('task', t.id, t.title, col.dot, isLive(t),
-        t.status === 'failed' ? 'failed' : pendingPermissions(t.id).length ? 'approve' : '')),
-    });
-  }
-
-  if (!groups.length) {
-    return `<div class="sidebar-empty">${filtersActive() ? 'no matches' : 'no cards yet'}</div>`;
-  }
-  // Truncated at SIDEBAR_MAX_ROWS: the overflow row opens the project's board
-  // rather than growing the rail, since that's where every card is already laid
-  // out in full — the rail stays a way in, not a place to read a backlog.
-  return groups.map(({ col, rows }) => `
-      <div class="sidebar-group">
-        <div class="sidebar-group-head">
-          <span class="dot" style="background:${col.dot}"></span>
-          <span class="sidebar-group-label">${esc(col.label)}</span>
-          <span class="count">${rows.length}</span>
-        </div>
-        ${rows.slice(0, SIDEBAR_MAX_ROWS).join('')}
-        ${rows.length > SIDEBAR_MAX_ROWS
-        ? `<button class="sidebar-more" data-more-board="${esc(repoId)}"
-                   title="Open this project's board to see all ${rows.length} cards">
-             ${icon('layout-grid')}
-             <span>Show ${rows.length - SIDEBAR_MAX_ROWS} more</span>
-           </button>`
-        : ''}
-      </div>`).join('');
-}
-
-// Live sessions of every kind for a repo — the number the rail badges.
-function repoLiveCount(repoId) {
-  return tasksForRepo(repoId).filter(isLive).length +
-    groomingsForRepo(repoId).filter(isGroomingLive).length +
-    orchestrationsForRepo(repoId).filter(isOrchestrationLive).length;
-}
-
-// `inOrg` drops the repo's avatar: it is the *organization's* avatar (GitHub
-// serves one per owner), so under an org heading that already shows it every
-// child row would repeat the same picture.
-function sidebarRepoHtml(r, inOrg) {
-  const tasks = tasksForRepo(r.id);
-  const live = repoLiveCount(r.id);
-  const open = sidebarExpanded.has(r.id);
-  const active = state.view.mode === 'workspace' && state.view.repoId === r.id;
+// One line per project: avatar, name, the checked-out branch (herdr shows a
+// space's branch next to its name), and the status rolled up from its agents.
+// `inOrg` drops the avatar: it is the *organization's* avatar (GitHub serves
+// one per owner), so under an org heading every row would repeat it.
+function projectHtml(r, inOrg, agents) {
+  const mine = agents.filter((a) => a.repoId === r.id);
+  const st = rollup(mine);
+  const active = activeTabKey() === `repo:${r.id}`;
   const avatarUrl = inOrg ? null : githubAvatarUrl(state.repoRemoteUrlByRepo.get(r.id));
+  const branch = state.repoBranchByRepo.get(r.id);
+  const branchText = branch && branch !== 'loading' ? branch : '';
+  const needs = mine.filter((a) => a.state === 'needs').length;
+  const working = mine.filter((a) => a.state === 'working').length;
+  const tip = [r.path, st ? `${STATE_TEXT[st]}: ${mine.filter((a) => a.state === st).length}` : 'Nothing running'].join('\n');
   return `
-      <div class="sidebar-project${open ? ' open' : ''}">
-        <div class="sidebar-project-head${active ? ' active' : ''}">
-          <button class="sidebar-twisty" data-toggle="${esc(r.id)}" aria-expanded="${open}"
-                  title="${open ? 'Collapse' : 'Expand'}" aria-label="${open ? 'Collapse' : 'Expand'} ${esc(r.name)}">
-            ${icon(open ? 'chevron-down' : 'chevron-right')}
-          </button>
-          <button class="sidebar-project-btn" data-repo="${esc(r.id)}" title="${esc(r.path)}">
+      <div class="sb-project">
+        <div class="sb-project-row${active ? ' active' : ''}">
+          <button class="sb-project-btn" data-repo="${esc(r.id)}" title="${esc(tip)}">
             ${avatarUrl
             ? `<img class="sidebar-avatar" src="${esc(avatarUrl)}" alt="" loading="lazy">`
             : `<span class="sidebar-project-icon">${icon('folder')}</span>`}
-            <span class="sidebar-project-name">${esc(r.name)}</span>
-            ${live
-            ? `<span class="chip running-badge" title="${live} live session${live === 1 ? '' : 's'}"><span class="spinner"></span>${live}</span>`
-            : `<span class="count">${tasks.length}</span>`}
+            <span class="sb-project-name">${esc(r.name)}</span>
+            ${branchText ? `<span class="sb-project-branch">${esc(branchText)}</span>` : ''}
+            <span class="sb-project-status">
+              ${needs ? `<span class="sb-pill needs">${needs}</span>` : ''}
+              ${working ? `<span class="sb-pill working">${working}</span>` : ''}
+              ${!needs && !working ? glyph(st, mine.some((a) => a.failed)) : ''}
+            </span>
           </button>
+          <button class="sb-project-add" data-new-session="${esc(r.id)}"
+                  title="New terminal session on ${esc(r.name)}" aria-label="New terminal session on ${esc(r.name)}">${icon('terminal')}</button>
         </div>
-        ${open ? `<div class="sidebar-project-body">${sidebarSessionsHtml(r.id)}<div class="sidebar-divider"></div>${sidebarGroupsHtml(r.id)}</div>` : ''}
+        ${sessionsHtml(r.id)}
       </div>`;
 }
 
 // An organization and the repos under it. Purely a container: the heading only
 // folds the group away — clicking it never changes the workspace, since an org
-// isn't a place you can be.
-function sidebarOrgHtml({ org, repos }) {
-  if (!org) return sidebarRepoHtml(repos[0], false);
+// isn't a place you can be. Folded, it still shows the group's rolled-up status
+// so a project that needs you can't hide inside a closed org.
+function orgHtml({ org, repos }, agents) {
+  if (!org) return projectHtml(repos[0], false, agents);
   const open = !sidebarOrgCollapsed.has(org.key);
-  const live = repos.reduce((n, r) => n + repoLiveCount(r.id), 0);
+  const ids = new Set(repos.map((r) => r.id));
+  const mine = agents.filter((a) => ids.has(a.repoId));
   const avatarUrl = githubAvatarUrl(org.remoteUrl);
   return `
-      <div class="sidebar-org${open ? ' open' : ''}">
-        <button class="sidebar-org-btn" data-org="${esc(org.key)}" aria-expanded="${open}"
+      <div class="sb-org${open ? ' open' : ''}">
+        <button class="sb-org-btn" data-org="${esc(org.key)}" aria-expanded="${open}"
                 title="${esc(`${org.label} — ${repos.length} repositories`)}">
-          <span class="sidebar-org-twisty">${icon(open ? 'chevron-down' : 'chevron-right')}</span>
+          <span class="sb-org-twisty">${icon(open ? 'chevron-down' : 'chevron-right')}</span>
           ${avatarUrl
           ? `<img class="sidebar-avatar" src="${esc(avatarUrl)}" alt="" loading="lazy">`
           : `<span class="sidebar-project-icon">${icon('folder')}</span>`}
-          <span class="sidebar-org-name">${esc(org.label)}</span>
-          ${live
-          ? `<span class="chip running-badge" title="${live} live session${live === 1 ? '' : 's'}"><span class="spinner"></span>${live}</span>`
-          : `<span class="count">${repos.length}</span>`}
+          <span class="sb-org-name">${esc(org.label)}</span>
+          ${open ? `<span class="count">${repos.length}</span>` : glyph(rollup(mine), mine.some((a) => a.failed))}
         </button>
-        ${open ? `<div class="sidebar-org-body">${repos.map((r) => sidebarRepoHtml(r, true)).join('')}</div>` : ''}
+        ${open ? `<div class="sb-org-body">${repos.map((r) => projectHtml(r, true, agents)).join('')}</div>` : ''}
       </div>`;
 }
 
 function renderSidebar() {
   const el = $('#sidebar');
   if (!el || !sidebarOn()) return;
-  // Waits for the first render that has repos — the layout is applied before
-  // boot() has loaded any state, and that empty pass must not burn the seed.
-  if (!sidebarSeeded && state.repos.length) {
-    sidebarSeeded = true;
-    if (state.view.mode === 'workspace') sidebarExpanded.add(state.view.repoId);
-  }
+  ensureSeen();
+  const agents = allAgents();
   // innerHTML rebuild is the same choke point the board uses; keep the scroll
   // position so a live task's SSE tick doesn't yank the list from under you.
   const scroll = el.scrollTop;
-  const superActive = state.view.mode === 'super';
+  const homeActive = activeTabKey() === 'super';
   el.innerHTML = `
-      <div class="sidebar-head">
-        <span class="sidebar-head-title">Projects</span>
-        <button class="btn ghost icon" id="sidebar-add-repo" title="Add a repository" aria-label="Add a repository">${icon('plus')}</button>
-      </div>
-      <button class="sidebar-super${superActive ? ' active' : ''}" data-super="1">
-        ${icon('layout-grid')}<span>All projects</span>
-        <span class="count">${state.repos.length}</span>
+      <button class="sb-home${homeActive ? ' active' : ''}" data-super="1">
+        ${icon('layout-grid')}<span>Home</span>
       </button>
-      <div class="sidebar-projects">
+      ${agentsSectionHtml(agents)}
+      <section class="sb-section" aria-label="Projects">
+        <div class="sb-section-head">
+          <span class="sb-section-title">Projects</span>
+          <button class="sb-section-add" id="sidebar-add-repo" title="Add a repository" aria-label="Add a repository">${icon('plus')}</button>
+        </div>
         ${state.repos.length
-        ? sidebarOrgEntries(state.repos).map(sidebarOrgHtml).join('')
+        ? sidebarOrgEntries(state.repos).map((e) => orgHtml(e, agents)).join('')
         : '<div class="sidebar-empty">No repositories yet.</div>'}
-      </div>`;
+      </section>`;
   el.scrollTop = scroll;
-  // Avatars come from the same per-repo branch lookup the Super View uses.
+  // Branches and avatars come from the same per-repo lookup the Super View uses.
   for (const r of state.repos) refreshRepoBranchCard(r.id);
 }
 
 // Opening a card from another project switches the workspace too, so closing
 // the drawer doesn't leave you on an unrelated board.
-function sidebarOpenTask(taskId) {
-  const t = state.tasks.get(taskId);
-  if (t && t.repoId && state.view.repoId !== t.repoId) enterWorkspace(t.repoId);
-  openDrawer(taskId);
+function openFromRail(kind, id) {
+  const item = kind === 'task' ? state.tasks.get(id)
+    : kind === 'grooming' ? state.groomings.get(id) : state.orchestrations.get(id);
+  if (item && item.repoId && (state.view.mode !== 'workspace' || state.view.repoId !== item.repoId)) {
+    enterWorkspace(item.repoId);
+  }
+  if (kind === 'task') openDrawer(id);
+  else if (kind === 'grooming') openGroomingDrawer(id);
+  else openOrchestrationDrawer(id);
+  // The drawer sets its open id synchronously, so this pass highlights the row.
+  renderSidebar();
 }
 
 // Load-time wiring. Called from app.js in the original source order.
@@ -295,21 +419,19 @@ export function init() {
 
   $('#sidebar').addEventListener('click', (e) => {
     if (e.target.closest('#sidebar-add-repo')) { openReposModal(); return; }
-    // Sessions are handled before the project row they sit under, since both
-    // live inside the same expanded project.
+    if (e.target.closest('[data-seen-all]')) { markAllSeen(); return; }
+    // The project row's terminal button sits inside the row, so it's checked
+    // before the project button itself.
     const addSession = e.target.closest('[data-new-session]');
     if (addSession) { openNewSessionMenu(addSession.dataset.newSession, addSession); return; }
-    // Overflow rows, checked before the card/project rows they sit among.
-    const moreSessions = e.target.closest('[data-more-sessions]');
-    if (moreSessions) {
-      const id = moreSessions.dataset.moreSessions;
-      if (sidebarSessionsExpanded.has(id)) sidebarSessionsExpanded.delete(id);
-      else sidebarSessionsExpanded.add(id);
+    const more = e.target.closest('[data-more]');
+    if (more) {
+      const key = more.dataset.more;
+      if (expandedGroups.has(key)) expandedGroups.delete(key);
+      else expandedGroups.add(key);
       renderSidebar();
       return;
     }
-    const moreBoard = e.target.closest('[data-more-board]');
-    if (moreBoard) { enterWorkspace(moreBoard.dataset.moreBoard); return; }
     const sessionBtn = e.target.closest('[data-session]');
     if (sessionBtn) { focusSession(sessionBtn.dataset.session); return; }
     const orgBtn = e.target.closest('[data-org]');
@@ -320,23 +442,13 @@ export function init() {
       renderSidebar();
       return;
     }
-    const twisty = e.target.closest('[data-toggle]');
-    if (twisty) {
-      const id = twisty.dataset.toggle;
-      if (sidebarExpanded.has(id)) sidebarExpanded.delete(id);
-      else sidebarExpanded.add(id);
-      renderSidebar();
-      return;
-    }
     if (e.target.closest('[data-super]')) { exitWorkspace(); return; }
     const repoBtn = e.target.closest('[data-repo]');
     if (repoBtn) { enterWorkspace(repoBtn.dataset.repo); return; }
-    const taskBtn = e.target.closest('[data-task]');
-    if (taskBtn) { sidebarOpenTask(taskBtn.dataset.task); return; }
-    const groomBtn = e.target.closest('[data-grooming]');
-    if (groomBtn) { openGroomingDrawer(groomBtn.dataset.grooming); return; }
-    const orchBtn = e.target.closest('[data-orchestration]');
-    if (orchBtn) openOrchestrationDrawer(orchBtn.dataset.orchestration);
+    for (const kind of ['task', 'grooming', 'orchestration']) {
+      const row = e.target.closest(`[data-${kind}]`);
+      if (row) { openFromRail(kind, row.dataset[kind]); return; }
+    }
   });
 
   // Same right-click menu as the board card, so the sidebar isn't a second-class
@@ -352,4 +464,4 @@ export function init() {
 }
 
 
-export { renderSidebar, sidebarExpanded };
+export { markSeen, renderSidebar };
