@@ -2,6 +2,7 @@
 import { $, COLUMNS, COLUMN_OF_STATUS, GROOMING_COLUMN, ORCH_COLUMN, isGroomingLive, isLive, isOrchestrationLive, state } from '../core/state.js';
 import { renderCard, renderGroomingCard, renderOrchestrationCard } from './cards.js';
 import { onDrop } from './dnd.js';
+import { boardViewMode, renderListView } from './list-view.js';
 import { filtersActive, groomingMatchesFilters, groomingsForRepo, orchestrationMatchesFilters, orchestrationsForRepo, taskMatchesFilters, tasksForRepo, updateFilterMeta } from './filters.js';
 import { pluginInstalled } from './settings.js';
 import { renderSidebar } from './sidebar.js';
@@ -22,16 +23,34 @@ function renderBoard() {
   if (state.view.mode !== 'workspace') { renderSuperView(); return; }
   updateFilterMeta();
   const board = $('#board');
-  board.innerHTML = '';
   const repoTasks = tasksForRepo(state.view.repoId);
   const repoGroomings = groomingsForRepo(state.view.repoId);
   const repoOrchestrations = orchestrationsForRepo(state.view.repoId);
+  const showGrooming = pluginInstalled('grooming') || repoGroomings.length > 0;
+  const showOrchestration = pluginInstalled('orchestration') || repoOrchestrations.length > 0;
+
+  // The list view draws the same cards, scoped and filtered the same way, as
+  // one grouped table (features/list-view.js). Same element, other shape.
+  const listMode = boardViewMode() === 'list';
+  board.classList.toggle('board-list', listMode);
+  if (listMode) {
+    renderListView(board, {
+      tasks: repoTasks.filter(taskMatchesFilters),
+      groomings: repoGroomings.filter(groomingMatchesFilters),
+      orchestrations: repoOrchestrations.filter(orchestrationMatchesFilters),
+      showGrooming,
+      showOrchestration,
+    });
+    return;
+  }
+
+  board.innerHTML = '';
 
   // Grooming leads the board. It's part of the process but has its own
   // lifecycle, so the column is locked: no drag in, no drag out. Shown when
   // the Idea Grooming plugin is installed, or when cards already exist (e.g.
   // a Linear import, or cards from before the plugin was uninstalled).
-  if (pluginInstalled('grooming') || repoGroomings.length) {
+  if (showGrooming) {
     const groomings = repoGroomings
       .filter(groomingMatchesFilters)
       .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
@@ -56,7 +75,7 @@ function renderBoard() {
   // Orchestration sits next to Grooming: also part of the process, also its
   // own lifecycle, also locked (no drag in, no drag out). Shown when the Goal
   // Orchestration plugin is installed, or when cards already exist.
-  if (pluginInstalled('orchestration') || repoOrchestrations.length) {
+  if (showOrchestration) {
     const orchestrations = repoOrchestrations
       .filter(orchestrationMatchesFilters)
       .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));

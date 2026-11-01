@@ -6,6 +6,7 @@ import { openDrawer } from './drawer.js';
 import { tasksForRepo } from './filters.js';
 import { openBriefModal } from './grooming.js';
 import { openLinearModal } from './linear.js';
+import { boardViewMode, toggleBoardViewMode } from './list-view.js';
 import { openMemoryModal } from './memory.js';
 import { openOrchestrateModal } from './orchestrate.js';
 import { openRepoSettingsModal } from './repo-settings.js';
@@ -65,6 +66,9 @@ function paletteCommands() {
     // Terminal button and "…" menu do.
     ...(state.view.repoId
       ? [
+        boardViewMode() === 'list'
+          ? { label: 'Switch to Board View', hint: 'Show the tasks as Kanban columns', icon: 'kanban', run: () => toggleBoardViewMode() }
+          : { label: 'Switch to List View', hint: 'Show every task in one table, grouped by stage', icon: 'list', run: () => toggleBoardViewMode() },
         { label: 'Open Terminal', hint: 'A shell on this workspace checkout', icon: 'terminal', run: () => openTerminalAt(state.view.repoId) },
         // One per package script of the workspace in front (Node Scripts plugin).
         ...scriptCommands(),
