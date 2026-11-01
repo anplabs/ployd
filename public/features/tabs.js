@@ -189,13 +189,14 @@ function closeActiveTab() {
 
 // ⌘D. A board can only be open once — a project tab shows the *same* `#board`
 // re-rendered (see the header), so there is no second copy to make. What can be
-// duplicated is a session: another shell of the same kind on the same checkout,
+// duplicated is a session: another shell of the same kind (and, for a custom
+// agent, the same Settings agent) on the same checkout,
 // the way ⌘D splits a pane in a terminal app. From a board tab the useful "new
 // one" is a plain shell on that project's checkout.
 function duplicateTab() {
   const tab = tabsOn() ? activeTab() : null;
   const s = tab?.kind === 'session' ? allSessions().find((x) => x.id === tab.id) : visibleSession();
-  if (s) { newSession(s.repoId, s.kind, s.cwd); return; }
+  if (s) { newSession(s.repoId, s.kind, s.cwd, s.agentId); return; }
   if (state.view.repoId) { newSession(state.view.repoId, 'shell'); return; }
   toast('Open a project or a session to duplicate', 'info');
 }

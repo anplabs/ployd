@@ -12,7 +12,7 @@ import { db, save, id, now, readLog, removeLog, getTask, getRepo, getGrooming, g
 import { broadcast, sse } from './bus';
 import { appRoot } from './paths';
 import type { GroomSpec } from './groomer';
-import type { AskSession, Task, Attachment, CustomModel, Grooming, GroomingTarget, Orchestration, Repo, PublicSettings, WorktreeInfo, TaskAgent } from './types';
+import type { AskSession, Task, Attachment, CustomModel, SessionAgent, Grooming, GroomingTarget, Orchestration, Repo, PublicSettings, WorktreeInfo, TaskAgent } from './types';
 import { suggestModel } from './models';
 import * as git from './git';
 import * as runner from './runner';
@@ -34,6 +34,7 @@ import * as conflicts from './conflicts';
 import * as prRefresh from './pr-refresh';
 import * as framing from './framing';
 import * as terminal from './terminal';
+import * as sessionAgents from './sessionAgents';
 import * as desktop from './desktop';
 import * as scripts from './scripts';
 import * as usage from './usage';
@@ -315,6 +316,8 @@ function publicSettings(): PublicSettings {
     sessionMemoryMb: db.settings.sessionMemoryMb ?? 'auto',
     // Derived, so the board can show what "Auto" means on this machine today.
     sessionMemoryAutoMb: runner.autoSessionMemoryMb(),
+    sessionAgents: db.settings.sessionAgents || [],
+    sessionAgentsFound: sessionAgents.availability(db.settings.sessionAgents),
   };
 }
 
@@ -685,6 +688,9 @@ app.patch('/api/settings', (req: Request, res: Response) => {
   // Custom models (e.g. Amazon Bedrock): the board sends the full desired list;
   // we sanitize it into clean entries (invalid rows dropped, API key stripped).
   if ('customModels' in req.body) db.settings.customModels = sanitizeCustomModels(req.body.customModels);
+  // Custom session agents: the board sends the full desired list; malformed rows
+  // are dropped, like custom models (server/sessionAgents.ts).
+  if ('sessionAgents' in req.body) db.settings.sessionAgents = sessionAgents.sanitize(req.body.sessionAgents);
 
   // Remote access: rotate the token on request (revokes all remote sessions),
   // then apply the on/off toggle — generating a token lazily when first enabling
@@ -995,8 +1001,12 @@ let terminalsRestored = false;
 // Opens an in-app shell session rooted at the repo root or one of its live
 // worktrees, so the user can drop into a terminal on the checkout they're
 // viewing without leaving Ployd. `kind` boots the shell straight into an
-// agent CLI ('claude' | 'codex' | 'grok'). Returns the new session's summary;
-// the board then streams it via GET /api/terminal/:id/stream.
+// agent CLI ('claude' | 'codex' | 'grok'), or `kind: 'custom'` + `agentId` into
+// one of the user's own agents from Settings. The body names an agent by *id*
+// only: its command is looked up in Settings here, an unknown id is refused, and
+// a `command` in the body is ignored — so this route can't be handed a command
+// line to run (same rule as the Run button's scripts route). Returns the new
+// session's summary; the board then streams it via GET /api/terminal/:id/stream.
 app.post('/api/repos/:id/terminal', async (req: Request, res: Response) => {
   const repo = db.repos.find((r) => r.id === req.params.id);
   if (!repo) return err(res, 404, 'Repo not found');
@@ -1004,10 +1014,15 @@ app.post('/api/repos/:id/terminal', async (req: Request, res: Response) => {
   if (!target) return err(res, 404, 'Path not found');
   const kind = req.body?.kind;
   if (kind !== undefined && !terminal.isKind(kind)) return err(res, 400, 'Unknown session kind');
+  let agent: SessionAgent | undefined;
+  if (kind === 'custom' || req.body?.agentId !== undefined) {
+    agent = sessionAgents.find(db.settings.sessionAgents, req.body?.agentId);
+    if (!agent) return err(res, 404, 'No such session agent in Settings');
+  }
   const cols = Number(req.body?.cols) || 80;
   const rows = Number(req.body?.rows) || 24;
   try {
-    res.json(terminal.create({ cwd: target, repoId: repo.id, kind, cols, rows }));
+    res.json(terminal.create({ cwd: target, repoId: repo.id, kind: agent ? 'custom' : kind, agent, cols, rows }));
   } catch (e) {
     err(res, 500, (e as Error).message);
   }

@@ -17,7 +17,7 @@ import { openShortcutsModal } from './shortcuts.js';
 import { openSpecsModal } from './specs.js';
 import { closeActiveTab, duplicateTab, tabsOn } from './tabs.js';
 import { openTaskModal } from './task-modal.js';
-import { STATUS_LABEL, allSessions, availableKinds, focusSession, newSession, openTerminalAt } from './terminal.js';
+import { STATUS_LABEL, allSessions, availableKinds, customAgents, focusSession, newSession, openTerminalAt } from './terminal.js';
 import {
   LAYOUT_LABEL, PALETTE_LABEL, THEME_LABEL, currentLayout, currentPalette, currentTheme, cyclePalette, cycleTheme,
   toggleLayout,
@@ -75,6 +75,13 @@ function paletteCommands() {
           hint: `${k.hint} on this workspace checkout`,
           icon: k.icon,
           run: () => newSession(state.view.repoId, k.kind),
+        })),
+        // And one per custom agent from Settings → Session agents.
+        ...customAgents().map((a) => ({
+          label: `New ${a.label} Session`,
+          hint: `${a.command} on this workspace checkout${a.found ? '' : ' (not found on PATH)'}`,
+          icon: a.icon,
+          run: () => newSession(state.view.repoId, 'custom', undefined, a.agentId),
         })),
         { label: `Reveal in ${state.desktop.fileManager || 'file manager'}`, hint: 'Show the checkout in your file manager', icon: 'folder-open', run: () => revealPath(state.view.repoId) },
         { label: defaultEditor() ? `Open in ${defaultEditor().label}` : 'Open in IDE', hint: 'Open the checkout in your editor', icon: 'code', run: () => openInIde(state.view.repoId, null, $('#workspace-more')) },
