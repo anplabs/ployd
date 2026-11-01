@@ -987,6 +987,19 @@
               <button class="btn ghost" id="setting-editor-rescan"><span class="i" data-icon="rotate-cw"></span>Rescan for editors</button>
             </fieldset>
             <fieldset class="addons">
+              <legend>Session agents</legend>
+              <p class="addon-hint">Your own agent commands for terminal sessions, offered in the new-session picker
+                after Claude, Codex and Grok — <code>aider</code>, <code>opencode</code>, <code>gemini</code>,
+                <code>claude --model opus</code>. The command is typed at a fresh shell's prompt on the checkout, as if
+                you had typed it yourself, so quitting the agent leaves you at a live prompt. One line, no secrets.</p>
+              <div id="session-agents-body" class="session-agents-body"></div>
+              <div class="session-agent-row session-agent-add">
+                <input id="session-agent-add-label" type="text" maxlength="40" placeholder="Name, e.g. Aider" aria-label="New agent name" />
+                <input id="session-agent-add-command" class="mono" type="text" maxlength="500" placeholder="Command, e.g. aider --model sonnet" aria-label="New agent command" />
+                <button class="btn" id="session-agent-add-btn"><span class="i" data-icon="plus"></span>Add</button>
+              </div>
+            </fieldset>
+            <fieldset class="addons">
               <legend>Pull requests</legend>
               <label class="check addon">
                 <input type="checkbox" id="setting-auto-resolve-conflicts" />

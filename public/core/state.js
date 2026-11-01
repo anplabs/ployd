@@ -16,7 +16,7 @@ const state = {
   addons: [],       // catalog of optional task behaviors (from /api/addons)
   personas: [],     // catalog of expert personas (from /api/personas)
   plugins: [],      // marketplace catalog (from /api/plugins)
-  settings: { notifications: true, sounds: true, maxParallelSessions: 3, installedPlugins: [], mergeStrategy: 'merge', minMergeGrade: 4, remoteAccess: false, remoteAccessConfigured: false, customModels: [], isolateMcpServers: true, sessionMemoryMb: 'auto', sessionMemoryAutoMb: 0 }, // user preferences (from /api/settings)
+  settings: { notifications: true, sounds: true, maxParallelSessions: 3, installedPlugins: [], mergeStrategy: 'merge', minMergeGrade: 4, remoteAccess: false, remoteAccessConfigured: false, customModels: [], isolateMcpServers: true, sessionMemoryMb: 'auto', sessionMemoryAutoMb: 0, sessionAgents: [], sessionAgentsFound: {} }, // user preferences (from /api/settings)
   filters: { search: '' }, // board filters (free-text only — repo scope comes from state.view)
   view: { mode: 'super' }, // { mode: 'super' } | { mode: 'workspace', repoId }
   // Work-area tabs (sidebar layout only — see features/tabs.js). An ordered list

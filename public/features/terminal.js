@@ -35,7 +35,28 @@ const SESSION_KINDS = [
   { kind: 'grok', label: 'xAI Grok', hint: 'Interactive grok session', icon: 'zap', health: 'grok' },
 ];
 
-// id -> session summary from the server ({ id, repoId, cwd, kind, label, status, createdAt }).
+// The user's own agent commands (Settings → General → Session agents), listed
+// after the built-ins as `kind: 'custom'` entries. The board only ever sends an
+// agent's id — the server looks the command up in Settings. `found` says whether
+// its program is on this machine's PATH; a missing one is still offered (marked),
+// because the login shell it is typed into may know an alias or a PATH entry the
+// server can't see.
+const CUSTOM_AGENT_ICON = 'square-terminal';
+function customAgents() {
+  const found = state.settings.sessionAgentsFound || {};
+  return (state.settings.sessionAgents || []).map((a) => ({
+    kind: 'custom',
+    agentId: a.id,
+    label: a.label,
+    command: a.command,
+    hint: found[a.id] ? a.command : `not on PATH · ${a.command}`,
+    found: !!found[a.id],
+    icon: CUSTOM_AGENT_ICON,
+  }));
+}
+
+// id -> session summary from the server ({ id, repoId, cwd, kind, label, status, createdAt },
+// plus `command` for a package script and `agentId` for a custom agent).
 const sessions = new Map();
 // id -> { el, xterm, fit, queue, sending, lastSize } for sessions with a
 // mounted pane. Panes are created on first visit and kept, so switching tabs
@@ -54,7 +75,9 @@ const panelOpen = () => !$('#terminal-panel').classList.contains('hidden');
 // session looks the same wherever it's listed. A session started from a package
 // script gets the Run button's play glyph rather than a bare terminal, so the
 // tab it opens is recognizable as the thing you just started.
-const sessionKindIcon = (kind) => SESSION_KINDS.find((k) => k.kind === kind)?.icon || 'terminal';
+const sessionKindIcon = (kind) => (kind === 'custom'
+  ? CUSTOM_AGENT_ICON
+  : SESSION_KINDS.find((k) => k.kind === kind)?.icon || 'terminal');
 const sessionIcon = (s) => (s.command ? 'play' : sessionKindIcon(s.kind));
 const repoName = (repoId) => state.repos.find((r) => r.id === repoId)?.name || '';
 const repoPath = (repoId) => state.repos.find((r) => r.id === repoId)?.path || '';
@@ -388,10 +411,13 @@ async function openSession(repoId, ask) {
 }
 
 // A plain shell, or one booted straight into an agent CLI, on a checkout.
-function newSession(repoId, kind, wtPath) {
+// `agentId` names a custom agent from Settings (kind 'custom') — its id, never
+// its command.
+function newSession(repoId, kind, wtPath, agentId) {
   return openSession(repoId, (dims) => api('POST', `/api/repos/${repoId}/terminal`, {
     path: wtPath || undefined,
     kind,
+    agentId: kind === 'custom' ? agentId : undefined,
     cols: dims ? dims.cols : undefined,
     rows: dims ? dims.rows : undefined,
   }));
@@ -441,7 +467,7 @@ function availableKinds() {
 function openNewSessionMenu(repoId, anchor) {
   const menu = $('#terminal-menu');
   const name = repoName(repoId);
-  menu.innerHTML = availableKinds().map((k) => `
+  const builtIn = availableKinds().map((k) => `
       <button class="quick-menu-item" data-kind="${esc(k.kind)}" role="menuitem">
         ${icon(k.icon)}
         <span class="quick-menu-item-body">
@@ -449,6 +475,16 @@ function openNewSessionMenu(repoId, anchor) {
           <span class="quick-menu-item-hint">${esc(name ? `${k.hint} — ${name}` : k.hint)}</span>
         </span>
       </button>`).join('');
+  const custom = customAgents().map((a) => `
+      <button class="quick-menu-item${a.found ? '' : ' missing'}" data-kind="custom" data-agent="${esc(a.agentId)}"
+              role="menuitem" title="${esc(a.found ? a.command : `${a.command}\nNot found on this machine's PATH — it may still be a shell alias or function`)}">
+        ${icon(a.found ? a.icon : 'triangle-alert')}
+        <span class="quick-menu-item-body">
+          <span class="quick-menu-item-label">${esc(a.label)}</span>
+          <span class="quick-menu-item-hint mono">${esc(a.hint)}</span>
+        </span>
+      </button>`).join('');
+  menu.innerHTML = builtIn + (custom ? `<div class="quick-menu-title quick-menu-sep" role="presentation">Your agents</div>${custom}` : '');
   newMenuFor = repoId;
   menu.classList.remove('hidden');
   // Same anchoring the workspace "…" and IDE pickers use, but the docked panel
@@ -594,11 +630,11 @@ export function init() {
     openNewSessionMenu(active ? active.repoId : state.view.repoId, e.currentTarget);
   });
   $('#terminal-menu').addEventListener('click', (e) => {
-    const kind = e.target.closest('[data-kind]')?.dataset.kind;
-    if (!kind) return;
+    const item = e.target.closest('[data-kind]');
+    if (!item) return;
     const repoId = newMenuFor;
     closeNewSessionMenu();
-    newSession(repoId, kind);
+    newSession(repoId, item.dataset.kind, undefined, item.dataset.agent);
   });
   document.addEventListener('click', (e) => {
     if (!newSessionMenuOpen()) return;
@@ -634,7 +670,7 @@ export function init() {
 
 
 export {
-  STATUS_LABEL, allSessions, applyTerminalEvent, availableKinds, endSession, focusSession,
+  STATUS_LABEL, allSessions, applyTerminalEvent, availableKinds, customAgents, endSession, focusSession,
   loadTerminalSessions, newSession, openNewSessionMenu, openSession, openTaskTerminal, openTerminalAt,
   restoreSessionTab, sessionIcon, sessionKindIcon, sessionsForRepo, syncTerminalHost,
   toggleTerminalPanel, visibleSession,

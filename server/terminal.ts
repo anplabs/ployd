@@ -6,6 +6,7 @@ import type { Writable } from 'stream';
 import * as bus from './bus';
 import { id, DATA_DIR } from './store';
 import * as runner from './runner';
+import type { SessionAgent } from './types';
 
 // In-app shell sessions. Each session is a real interactive shell running on a
 // pseudo-terminal so prompts, colors, and full-screen apps (vim, top) work. We
@@ -14,7 +15,9 @@ import * as runner from './runner';
 // the only dep). python3 ships on macOS dev machines (Command Line Tools) and
 // virtually all Linux; Windows has no pty here and falls back to a plain pipe.
 //
-// A session can boot straight into an agent CLI (`kind`) or into a command
+// A session can boot straight into an agent CLI (`kind`), into one of the
+// user's own agents from Settings (`kind: 'custom'` + `agent`, looked up by id
+// in the route — never a command from the request), or into a command
 // (`command`, e.g. the `npm run dev` behind the workspace's Run button): the
 // shell starts as usual and the line is typed into it, so quitting `claude` —
 // or Ctrl-C'ing the dev server — leaves you at a live prompt instead of killing
@@ -29,7 +32,7 @@ import * as runner from './runner';
 // lists sessions via GET /api/terminal/sessions and reattaches to each one's
 // output with the stream route.
 
-type Kind = 'shell' | 'claude' | 'codex' | 'grok';
+type Kind = 'shell' | 'claude' | 'codex' | 'grok' | 'custom';
 // active = alive and printing; idle = alive but quiet (sitting at a prompt,
 // waiting for you); exited = the process is gone. The board renders them as a
 // green / amber / red bullet.
@@ -47,6 +50,8 @@ interface Session {
   // The line typed at the fresh prompt for a command session (a package
   // script), else undefined. Kept so the board can label and re-run it.
   command?: string;
+  // The Settings id of a custom agent session, so the board can duplicate it.
+  agentId?: string;
   child: ChildProcessWithoutNullStreams;
   // The relay's resize channel (fd 3); null on Windows, which has no pty here.
   control: Writable | null;
@@ -69,6 +74,7 @@ interface Summary {
   kind: Kind;
   label: string;
   command?: string;
+  agentId?: string;
   status: Status;
   createdAt: string;
 }
@@ -94,11 +100,11 @@ const SAVED_PATH = path.join(DATA_DIR, 'terminal-sessions.json');
 const SAVE_DEBOUNCE_MS = 250;
 
 const KIND_LABEL: Record<Kind, string> = {
-  shell: 'Shell', claude: 'Claude', codex: 'Codex', grok: 'Grok',
+  shell: 'Shell', claude: 'Claude', codex: 'Codex', grok: 'Grok', custom: 'Agent',
 };
 
 function isKind(v: unknown): v is Kind {
-  return v === 'shell' || v === 'claude' || v === 'codex' || v === 'grok';
+  return v === 'shell' || v === 'claude' || v === 'codex' || v === 'grok' || v === 'custom';
 }
 
 // The binary a non-shell session types at its prompt. Uses the same resolved
@@ -125,7 +131,7 @@ function statusOf(s: Session): Status {
 function summary(s: Session): Summary {
   return {
     id: s.id, repoId: s.repoId, cwd: s.cwd, kind: s.kind,
-    label: s.label, command: s.command, status: statusOf(s), createdAt: s.createdAt,
+    label: s.label, command: s.command, agentId: s.agentId, status: statusOf(s), createdAt: s.createdAt,
   };
 }
 
@@ -261,6 +267,7 @@ function trimExited(): void {
 // reuses the saved id, label and creation time, and prints `notice` at the top
 // of the pane.
 function create(opts: {
+  agent?: SessionAgent;
   cwd: string; repoId: string; kind?: Kind; command?: string; cols?: number; rows?: number;
   restored?: { id: string; label: string; base: string; createdAt: string; notice: string };
 }): Summary {
@@ -299,6 +306,15 @@ function create(opts: {
     lastActivity: Date.now(),
     status: 'active',
   };
+  // A custom agent session is named after its Settings label and numbered the
+  // same way ("Aider", "Aider 2"), and types that agent's saved command.
+  const { agent } = opts;
+  if (agent) {
+    session.kind = 'custom';
+    session.agentId = agent.id;
+    session.base = agent.label;
+    session.label = labelFor(repoId, agent.label);
+  }
   sessions.set(sid, session);
 
   const emit = (chunk: Buffer) => {
@@ -332,7 +348,7 @@ function create(opts: {
   // exec'ing it, so the tab survives quitting the agent / stopping the script.
   // The pty buffers this until the shell reads it.
   const bin = launchBin(kind);
-  const startup = command || (bin ? shQuote(bin) : null);
+  const startup = command || agent?.command || (bin ? shQuote(bin) : null);
   if (startup) child.stdin.write(`${startup}\n`);
 
   syncSweep();
@@ -503,7 +519,9 @@ function readSaved(): SavedSession[] {
 
 function noticeFor(s: SavedSession): string {
   if (s.command) return `Restored after restart. "${s.command}" was not restarted.`;
-  if (s.kind !== 'shell') return `Restored after restart. The previous ${KIND_LABEL[s.kind]} session ended.`;
+  // A custom agent is named by its own label ("Aider"), not the generic "Agent".
+  const what = s.kind === 'custom' ? s.base : KIND_LABEL[s.kind];
+  if (s.kind !== 'shell') return `Restored after restart. The previous ${what} session ended.`;
   return 'Restored after restart.';
 }
 

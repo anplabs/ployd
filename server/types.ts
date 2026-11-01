@@ -28,6 +28,19 @@ export interface CustomModel {
   env: Record<string, string>;
 }
 
+// A user-defined agent command for in-app terminal sessions (Settings → General
+// → Session agents), e.g. `aider` or `claude --model opus`. The board starts a
+// session with one by sending its `id`; the server looks `command` up here and
+// types it at the fresh shell's prompt. See server/sessionAgents.ts.
+export interface SessionAgent {
+  // A short unique slug, stable across edits of the label or command.
+  id: string;
+  // What the picker, the tab and the sidebar call it ("Aider", then "Aider 2").
+  label: string;
+  // The single line typed at the prompt, verbatim.
+  command: string;
+}
+
 export interface Settings {
   notifications: boolean;
   sounds: boolean;
@@ -107,6 +120,9 @@ export interface Settings {
   //   0      — no budget (the old behavior)
   //   n      — that many MB
   sessionMemoryMb: number | 'auto';
+  // User-defined agent commands the terminal's new-session picker offers after
+  // the built-in kinds. Empty by default. See SessionAgent.
+  sessionAgents: SessionAgent[];
 }
 
 // The redacted, board-facing view of Settings. Omits the raw Linear token and
@@ -137,6 +153,11 @@ export interface PublicSettings {
   // What 'auto' resolves to on this machine right now (MB), so the board can
   // label the Auto option honestly instead of guessing. Derived, never stored.
   sessionMemoryAutoMb: number;
+  // Not a secret — returned as-is so Settings can edit them and the picker list them.
+  sessionAgents: SessionAgent[];
+  // id -> whether that agent's program was found on this machine's PATH, so the
+  // picker can mark a missing one. Derived on each read, never stored.
+  sessionAgentsFound: Record<string, boolean>;
 }
 
 // A marketplace plugin as the UI lists it. The full catalog lives in

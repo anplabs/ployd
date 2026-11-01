@@ -65,6 +65,8 @@ const DEFAULT_SETTINGS: Settings = {
   // machine's RAM and the parallel-session cap, so several sessions can't each
   // size themselves against the whole machine and push it into swap.
   sessionMemoryMb: 'auto',
+  // No custom session agents until the user adds one in Settings → General.
+  sessionAgents: [],
 };
 
 let db: Db = { repos: [], tasks: [], groomings: [], orchestrations: [], settings: { ...DEFAULT_SETTINGS } };

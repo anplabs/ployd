@@ -40,6 +40,7 @@ static with **no build step** (see Conventions).
 | `server/terminal.ts` | In-app shell sessions: a pty per session (a python3 relay, no native module), their status, the resize channel, and the saved list that restores them after a restart (see "Terminal sessions"). |
 | `server/desktop.ts` | Desktop hand-offs for the workspace quick actions: reveal a checkout in the OS file manager, or open it in the user's IDE (see "Workspace quick actions"). |
 | `server/scripts.ts` | Reads a checkout's `package.json` scripts and the package manager that runs them, and turns a script *name* into a command line (see "Package scripts"). Runs nothing itself. |
+| `server/sessionAgents.ts` | The user's own terminal-session agents (`Settings.sessionAgents`): sanitizing the list, the id → command lookup, and the PATH check behind the picker's "not found" mark (see "Terminal sessions"). Runs nothing itself. |
 | `server/resources.ts` | Opt-in resource monitor: samples the OS process table and reports what the app and each live agent session cost this machine (see "Resource monitor"). |
 | `server/github.ts` | `gh` CLI integration: read-only lookup of a task's pull request, its merge-safety check, the merge itself, and the `mergeable/<n>` grade label. |
 | `server/reviewer.ts` | Meta-prompt + verdict parser for the **Code Review** stage (see "Code Review" below). |
@@ -715,9 +716,31 @@ relaunch) doesn't lose the tabs — see "Restored after a restart" below.
   panel is dragged. The old approach (pushing an `stty` through stdin) only worked at
   a bare prompt and echoed itself across the screen. Windows has no pty here and
   falls back to a plain-pipe `cmd.exe`, where resize is a no-op.
-- **`kind`** (`shell` | `claude` | `codex` | `grok`) is *typed at the shell's prompt*,
-  not exec'd — so quitting the agent leaves you at a live prompt instead of killing
-  the tab. The picker only offers a CLI `/api/health` actually found on this machine.
+- **`kind`** (`shell` | `claude` | `codex` | `grok` | `custom`) is *typed at the shell's
+  prompt*, not exec'd — so quitting the agent leaves you at a live prompt instead of
+  killing the tab. The picker only offers a built-in CLI `/api/health` actually found on
+  this machine.
+- **Custom agents** (`kind: 'custom'`) are the user's own commands — `aider`,
+  `opencode`, `gemini`, `claude --model opus` — saved in `Settings.sessionAgents`
+  (`[{ id, label, command }]`, empty by default) and edited in Settings → General →
+  Session agents (`public/features/settings-modal.js`). `server/sessionAgents.ts`
+  sanitizes the list the way custom models are: a row needs a non-empty label (≤ 40
+  chars) and a single-line command (≤ 500 chars, no control characters), malformed
+  rows are dropped, and an id is kept when it is a valid unused slug, minted from the
+  label otherwise. **The id-only rule** is the Run button's: the board sends
+  `{ kind: 'custom', agentId }`, the route looks the command up in Settings
+  (`sessionAgents.find`), an unknown id is a 404, and a `command` in the body is
+  ignored — `POST /api/repos/:id/terminal` never types a line it got from a request.
+  The session carries `agentId` (so ⌘D duplicates it) and is labeled and numbered
+  after the agent's label ("Aider", "Aider 2"), with the `square-terminal` glyph. The
+  picker lists them after the built-ins under "Your agents", and ⌘K gets a
+  "New <label> Session" per agent. Whether each one's program is on PATH comes from a
+  filesystem lookup (`PublicSettings.sessionAgentsFound`, derived on every read) —
+  never a `--version` probe, since these are arbitrary commands. A missing one is
+  **still offered, dimmed and marked**: the login shell it is typed into may resolve an
+  alias, a function or a PATH entry the server can't see. Like any other agent session,
+  a restart brings it back as a plain shell (no `agentId`), with a notice that names
+  the agent's label.
 - **Status** is the green/amber/red bullet every surface shows: `active` (alive and
   printing), `idle` (alive but quiet for 30s — sitting at a prompt, waiting for you),
   `exited` (the process is gone; the tab stays red and its scrollback readable until
