@@ -8,7 +8,7 @@ import { groomingsForRepo, orchestrationsForRepo, tasksForRepo } from './filters
 import { renderHome } from './home.js';
 import { openReposModal, renderRepoList } from './repos-modal.js';
 import { renderRunButton } from './scripts.js';
-import { renderSidebar, sidebarExpanded } from './sidebar.js';
+import { renderSidebar } from './sidebar.js';
 import { applyPanes, noteRepoTab, noteSuperTab, renderTabStrip } from './tabs.js';
 import { closeWorkspaceMenu } from './workspace-menu.js';
 
@@ -35,14 +35,13 @@ function setView(view) {
   saveView();
   renderView();
 }
-// Entering a workspace unfolds it in the project sidebar (if that layout is
-// on), so the board you switched to and the rail agree on what's in focus, and
-// opens/raises its tab in the work-area strip (a no-op in the classic layout).
+// Entering a workspace opens/raises its tab in the work-area strip (a no-op in
+// the classic layout), and renderView() redraws the rail so its project row
+// highlights the board you switched to.
 // Every surface that switches workspace goes through here — the sidebar, ⌘K,
 // the header's switcher, a Super View card, a tab — which is what keeps the
 // rail, the strip and the board from ever disagreeing.
 const enterWorkspace = (repoId) => {
-  sidebarExpanded.add(repoId);
   noteRepoTab(repoId);
   setView({ mode: 'workspace', repoId });
 };
