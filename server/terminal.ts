@@ -1,8 +1,10 @@
+import fs from 'fs';
+import path from 'path';
 import { spawn } from 'child_process';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { Writable } from 'stream';
 import * as bus from './bus';
-import { id } from './store';
+import { id, DATA_DIR } from './store';
 import * as runner from './runner';
 
 // In-app shell sessions. Each session is a real interactive shell running on a
@@ -18,10 +20,14 @@ import * as runner from './runner';
 // or Ctrl-C'ing the dev server — leaves you at a live prompt instead of killing
 // the tab.
 //
-// Sessions are process-local and never persisted — like interactive permission
-// prompts, they only make sense while this server is up. They die with it; the
-// board lists the survivors via GET /api/terminal/sessions and reattaches to
-// each one's output with the stream route.
+// The processes are process-local (they die with this server), but the *list*
+// of live sessions is persisted: terminal-sessions.json under PLOYD_DATA_DIR,
+// no scrollback. On the next boot restore() brings each one back as a fresh
+// login shell at the same checkout, under the same id and label, so the board's
+// tabs still point at it. Whatever ran inside (an agent CLI, a package script)
+// is not resumed; a dim notice at the top of the new pane says so. The board
+// lists sessions via GET /api/terminal/sessions and reattaches to each one's
+// output with the stream route.
 
 type Kind = 'shell' | 'claude' | 'codex' | 'grok';
 // active = alive and printing; idle = alive but quiet (sitting at a prompt,
@@ -76,6 +82,16 @@ const SWEEP_MS = 5_000;
 // Exited sessions stay listed — a red tab you can still scroll back through —
 // until dismissed. Cap how many we hold so a long day doesn't grow forever.
 const MAX_EXITED = 20;
+
+// The saved list of live sessions (see the header comment). A sibling of
+// db.json rather than a field in it: it is runtime state nothing reads through
+// /api/state, and it changes on every shell exit, so there's no reason to
+// rewrite the whole db for it.
+const SAVED_PATH = path.join(DATA_DIR, 'terminal-sessions.json');
+// Debounced like store.save, but a little longer: a shell that dies *because*
+// the server is going down (a Ctrl-C reaching the relay too) must not get the
+// chance to drop itself from the list before the process is gone.
+const SAVE_DEBOUNCE_MS = 250;
 
 const KIND_LABEL: Record<Kind, string> = {
   shell: 'Shell', claude: 'Claude', codex: 'Codex', grok: 'Grok',
@@ -240,13 +256,18 @@ function trimExited(): void {
 // the shell process can't be spawned. `command` types one line at the fresh
 // prompt (a package script — server/scripts.ts builds it); it is a plain shell
 // either way, so the session outlives whatever it started.
+//
+// `restored` is internal to restore() and never reachable from a route: it
+// reuses the saved id, label and creation time, and prints `notice` at the top
+// of the pane.
 function create(opts: {
   cwd: string; repoId: string; kind?: Kind; command?: string; cols?: number; rows?: number;
+  restored?: { id: string; label: string; base: string; createdAt: string; notice: string };
 }): Summary {
-  const { cwd, repoId } = opts;
+  const { cwd, repoId, restored } = opts;
   const kind: Kind = isKind(opts.kind) ? opts.kind : 'shell';
   const command = typeof opts.command === 'string' && opts.command.trim() ? opts.command.trim() : undefined;
-  const sid = id();
+  const sid = restored && !sessions.has(restored.id) ? restored.id : id();
   const shell = process.env.SHELL || '/bin/bash';
   const { cmd, args } = ptyCommand(shell, opts.cols || 80, opts.rows || 24);
   const child = spawn(cmd, args, {
@@ -259,13 +280,13 @@ function create(opts: {
   }) as ChildProcessWithoutNullStreams;
   const control = (child.stdio[3] as Writable | undefined) ?? null;
 
-  const base = command || KIND_LABEL[kind];
+  const base = restored ? restored.base : (command || KIND_LABEL[kind]);
   const session: Session = {
     id: sid,
     repoId,
     cwd,
     kind,
-    label: labelFor(repoId, base),
+    label: restored ? restored.label : labelFor(repoId, base),
     base,
     command,
     child,
@@ -274,7 +295,7 @@ function create(opts: {
     bufferBytes: 0,
     listeners: new Set(),
     exited: false,
-    createdAt: new Date().toISOString(),
+    createdAt: restored ? restored.createdAt : new Date().toISOString(),
     lastActivity: Date.now(),
     status: 'active',
   };
@@ -291,6 +312,9 @@ function create(opts: {
     if (session.status !== 'active') announce(session);
     for (const fn of session.listeners) fn(b64);
   };
+  // A restored session's notice goes first in the buffer, so it is the top line
+  // of the pane, above the new shell's prompt, on every replay.
+  if (restored) emit(Buffer.from(`\x1b[2m${restored.notice}\x1b[0m\r\n`));
   child.stdout.on('data', emit);
   child.stderr.on('data', emit);
   const onDead = () => {
@@ -299,6 +323,7 @@ function create(opts: {
     for (const fn of session.listeners) fn('');
     announce(session);
     trimExited();
+    persist();
   };
   child.on('exit', onDead);
   child.on('error', onDead);
@@ -312,6 +337,7 @@ function create(opts: {
 
   syncSweep();
   bus.broadcast({ type: 'terminal', session: summary(session) });
+  persist();
   return summary(session);
 }
 
@@ -368,6 +394,7 @@ function close(sid: string): void {
   for (const fn of s.listeners) fn('');
   announce(s);
   trimExited();
+  persist();
 }
 
 // Kills (if needed) and forgets a session entirely — the tab's × and the
@@ -380,11 +407,138 @@ function remove(sid: string): void {
   sessions.delete(sid);
   syncSweep();
   bus.broadcast({ type: 'terminal-removed', id: sid });
+  persist();
 }
 
+// Shutdown (app quit, auto-update relaunch, Ctrl-C on the dev server): write the
+// live list as it stands *first*, then kill every shell without letting those
+// deaths reach the file. They are the server going away, not the user closing
+// tabs, and the next boot should restore exactly what was open.
 function closeAll(): void {
-  for (const sid of [...sessions.keys()]) remove(sid);
+  flushSaved();
+  suspended = true;
+  try {
+    for (const sid of [...sessions.keys()]) remove(sid);
+  } finally {
+    suspended = false;
+  }
 }
 
-export { create, get, list, attach, write, resize, close, remove, closeAll, isKind };
-export type { Kind, Status, Summary };
+// ---------- persistence: the list of live sessions, restored on boot ----------
+
+// One row per live session. `kind`/`command` are what it was started as, kept
+// only so the restore notice can say what didn't come back.
+interface SavedSession {
+  id: string;
+  repoId: string;
+  cwd: string;
+  kind: Kind;
+  label: string;
+  base: string;
+  command?: string;
+  createdAt: string;
+}
+
+let saveTimer: NodeJS.Timeout | null = null;
+let suspended = false;
+
+function savedRows(): SavedSession[] {
+  return [...sessions.values()]
+    .filter((s) => !s.exited)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .map((s) => ({
+      id: s.id, repoId: s.repoId, cwd: s.cwd, kind: s.kind,
+      label: s.label, base: s.base, command: s.command, createdAt: s.createdAt,
+    }));
+}
+
+// Writes the live list now, atomically (temp file + rename, like db.json).
+// Best effort: a failed write must never take a terminal route down with it.
+function flushSaved(): void {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (suspended) return;
+  try {
+    const tmp = SAVED_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, sessions: savedRows() }, null, 2));
+    fs.renameSync(tmp, SAVED_PATH);
+  } catch (e) {
+    console.error('[terminal] failed to save the session list:', (e as Error).message);
+  }
+}
+
+// Called on every change to the live set: create, close, remove, exit.
+function persist(): void {
+  if (suspended || saveTimer) return;
+  saveTimer = setTimeout(flushSaved, SAVE_DEBOUNCE_MS);
+  saveTimer.unref();
+}
+
+// The saved list as written, minus any malformed row. A missing or unreadable
+// file means there is nothing to restore.
+function readSaved(): SavedSession[] {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(SAVED_PATH, 'utf8'));
+  } catch {
+    return [];
+  }
+  const rows = (raw as { sessions?: unknown } | null)?.sessions;
+  if (!Array.isArray(rows)) return [];
+  const str = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+  const seen = new Set<string>();
+  const out: SavedSession[] = [];
+  for (const r of rows as Array<Record<string, unknown> | null>) {
+    if (!r || !str(r.id) || !/^[\w-]{1,64}$/.test(r.id) || seen.has(r.id)) continue;
+    if (!str(r.repoId) || !str(r.cwd) || !isKind(r.kind) || !str(r.label)) continue;
+    seen.add(r.id);
+    out.push({
+      id: r.id, repoId: r.repoId, cwd: r.cwd, kind: r.kind, label: r.label,
+      base: str(r.base) ? r.base : r.label,
+      command: str(r.command) ? r.command : undefined,
+      createdAt: str(r.createdAt) ? r.createdAt : new Date().toISOString(),
+    });
+  }
+  return out;
+}
+
+function noticeFor(s: SavedSession): string {
+  if (s.command) return `Restored after restart. "${s.command}" was not restarted.`;
+  if (s.kind !== 'shell') return `Restored after restart. The previous ${KIND_LABEL[s.kind]} session ended.`;
+  return 'Restored after restart.';
+}
+
+// Boot: recreate each saved session as a plain login shell at its checkout,
+// under its old id and label. `resolveCwd` is the caller's checkout check (the
+// same one the terminal routes use); a row it rejects (repo unregistered,
+// worktree removed, directory gone) is skipped, so the saved file can never
+// open a shell anywhere a route couldn't. A restored session is a `shell` with
+// no command: nothing is typed at its prompt, and the board must not show an
+// agent or a play glyph for something that is no longer running.
+async function restore(
+  resolveCwd: (repoId: string, cwd: string) => Promise<string | null>,
+): Promise<Summary[]> {
+  const restored: Summary[] = [];
+  for (const s of readSaved()) {
+    let cwd: string | null = null;
+    try {
+      cwd = await resolveCwd(s.repoId, s.cwd);
+    } catch {
+      cwd = null;
+    }
+    if (!cwd) continue;
+    try {
+      restored.push(create({
+        cwd, repoId: s.repoId, kind: 'shell',
+        restored: { id: s.id, label: s.label, base: s.base, createdAt: s.createdAt, notice: noticeFor(s) },
+      }));
+    } catch (e) {
+      console.error('[terminal] failed to restore a session:', (e as Error).message);
+    }
+  }
+  // Rewrite the list now, so skipped rows are gone even if nothing else changes.
+  flushSaved();
+  return restored;
+}
+
+export { create, get, list, attach, write, resize, close, remove, closeAll, isKind, restore, flushSaved, readSaved, SAVED_PATH };
+export type { Kind, Status, Summary, SavedSession };

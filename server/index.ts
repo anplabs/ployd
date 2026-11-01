@@ -969,6 +969,29 @@ async function resolveRepoTarget(repo: Repo, rawPath: unknown): Promise<string |
   return live.some((w) => w.path === target) ? target : null;
 }
 
+// Brings back the shell sessions that were open when the server last stopped
+// (see server/terminal.ts). Each saved checkout goes through the same check the
+// terminal routes use: its repo must still be registered, the path must be the
+// repo root or one of its live worktrees, and the directory must still exist.
+// Anything else is skipped, so the saved list can't open a shell anywhere a
+// route couldn't.
+async function restoreTerminalSessions(): Promise<terminal.Summary[]> {
+  return terminal.restore(async (repoId, cwd) => {
+    const repo = getRepo(repoId);
+    if (!repo) return null;
+    const target = await resolveRepoTarget(repo, cwd);
+    if (!target) return null;
+    try {
+      return fs.statSync(target).isDirectory() ? target : null;
+    } catch {
+      return null;
+    }
+  });
+}
+// Once per process: start() can be called again on a busy port (Electron walks
+// a port ladder), and a second pass would spawn every shell twice.
+let terminalsRestored = false;
+
 // Opens an in-app shell session rooted at the repo root or one of its live
 // worktrees, so the user can drop into a terminal on the checkout they're
 // viewing without leaving Ployd. `kind` boots the shell straight into an
@@ -2150,7 +2173,17 @@ function rebind(): void {
  * access is enabled in settings (see bindHost).
  * @param port - desired port; pass 0 for an OS-assigned free port.
  */
-function start(port: string | number = process.env.PORT || 7777): Promise<{ server: Server; port: number; url: string }> {
+async function start(port: string | number = process.env.PORT || 7777): Promise<{ server: Server; port: number; url: string }> {
+  // Restore the shell sessions before listening, so the first board to connect
+  // already sees them; otherwise its saved tabs would be pruned as dead.
+  if (!terminalsRestored) {
+    terminalsRestored = true;
+    try {
+      await restoreTerminalSessions();
+    } catch (e) {
+      console.error('[terminal] restore failed:', (e as Error).message);
+    }
+  }
   return new Promise((resolve, reject) => {
     const server = app.listen(Number(port), bindHost(), () => {
       httpServer = server;
@@ -2182,6 +2215,7 @@ export { app, start, runner, terminal };
 // Test-only exports for the remote-access gate (see tests/smoke.test.ts).
 export { authorizeRemote as _authorizeRemote, parseCookies as _parseCookies, lanAddresses as _lanAddresses };
 export { isHostAllowed as _isHostAllowed, strippedTokenUrl as _strippedTokenUrl };
+export { restoreTerminalSessions as _restoreTerminalSessions };
 
 // When run directly (`node server/index.js` / `tsx server/index.ts`), boot as a
 // standalone server.
@@ -2192,6 +2226,9 @@ if (require.main === module) {
 
   process.on('SIGINT', () => {
     runner.stopAll();
+    // Saves the open shell sessions before killing them, so the next boot
+    // restores them (see server/terminal.ts).
+    terminal.closeAll();
     process.exit(0);
   });
 }

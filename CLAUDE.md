@@ -37,7 +37,7 @@ static with **no build step** (see Conventions).
 | `server/tasks.ts` | Task lifecycle service (`createTask`/`dispatchTask` + capacity gate) shared by the REST API and the MCP server, so both queue/run tasks identically. |
 | `server/mcp.ts` | **Board MCP server** (see "MCP server" below). Streamable-HTTP MCP endpoint mounted on the Express app at `POST /mcp` so outside MCP clients can drive the board while Ployd runs. |
 | `server/git.ts` | Worktree lifecycle (`git worktree add/remove`). |
-| `server/terminal.ts` | In-app shell sessions: a pty per session (a python3 relay, no native module), their status, and the resize channel (see "Terminal sessions"). |
+| `server/terminal.ts` | In-app shell sessions: a pty per session (a python3 relay, no native module), their status, the resize channel, and the saved list that restores them after a restart (see "Terminal sessions"). |
 | `server/desktop.ts` | Desktop hand-offs for the workspace quick actions: reveal a checkout in the OS file manager, or open it in the user's IDE (see "Workspace quick actions"). |
 | `server/scripts.ts` | Reads a checkout's `package.json` scripts and the package manager that runs them, and turns a script *name* into a command line (see "Package scripts"). Runs nothing itself. |
 | `server/resources.ts` | Opt-in resource monitor: samples the OS process table and reports what the app and each live agent session cost this machine (see "Resource monitor"). |
@@ -701,9 +701,10 @@ into and operate yourself — including `claude`, `codex` or `grok` running
 interactively. It has no card, no column, and no lifecycle on the board; the whole
 point is that it's the escape hatch *next to* the board, not another thing to manage.
 
-`server/terminal.ts` owns them. They are **process-local and never persisted** (like
-interactive permission prompts): they die with the server, and a reloading board
-rebuilds its tabs from `GET /api/terminal/sessions`.
+`server/terminal.ts` owns them. The **processes** are process-local: they die with the
+server, and a reloading board rebuilds its tabs from `GET /api/terminal/sessions`. The
+**list of live sessions** is persisted, so a restart (app quit, crash, auto-update
+relaunch) doesn't lose the tabs — see "Restored after a restart" below.
 
 - **The pty.** Each session runs the user's login shell on a real pseudo-terminal,
   allocated by a small **python3 relay** (`PTY_RELAY`) rather than a native module
@@ -732,6 +733,26 @@ rebuilds its tabs from `GET /api/terminal/sessions`.
   own feed and the keystroke POSTs. The client reopens it whenever the set of mounted
   panes changes and repaints from the replay — which is also why a dropped-and-
   reconnected stream doesn't paint the scrollback twice.
+- **Restored after a restart.** Every create / close / dismiss / exit rewrites
+  `terminal-sessions.json` under `PLOYD_DATA_DIR` (a sibling of `db.json`, atomic temp
+  file + rename, debounced 250 ms). It holds only sessions that were **alive** — id,
+  repoId, cwd, kind, label, the label's numbering base, any command, createdAt — and
+  never scrollback. On boot `index.start()` calls `restoreTerminalSessions()` **before
+  listening** (and once per process, since Electron's port ladder can call `start()`
+  again), so the first board to connect already sees them. Each row is recreated as a
+  **plain login shell** at its cwd under the **same id and label**, so `ployd.tabs` in
+  `localStorage` still points at it. Nothing is re-typed: the agent or script is *not*
+  resumed, and the pane opens with a dim notice ("Restored after restart. The previous
+  Claude session ended."). A restored session's `kind` becomes `shell` and its
+  `command` is dropped, so the board shows a terminal glyph rather than claiming an
+  agent or a dev server is running in it; the label is what tells you what it was.
+  Rows are validated through `resolveRepoTarget` (repo still registered, path is the
+  root or a live worktree) plus a directory-exists check, and a row that fails is
+  dropped — so the file can never open a shell anywhere a route couldn't. Exited
+  sessions are never saved, so a red tab is pruned by `pruneTabs()` after a restart.
+  `closeAll()` (Electron's `before-quit`, the dev server's SIGINT) flushes the list
+  *before* killing the shells and keeps those deaths out of the file: the server going
+  away is not the user closing tabs.
 
 On the board (`public/features/terminal.js`) a session has **two possible homes, one
 per layout**: a tab in the panel docked at the bottom of the window (classic), or a
