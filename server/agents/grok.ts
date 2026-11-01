@@ -152,6 +152,8 @@ function promptArgs(prompt: string): PromptDelivery {
   return {
     args: ['--prompt-file', file],
     cleanup: () => fs.rmSync(file, { force: true }),
+    // Recorded by a detached run, which may have to delete it after a restart.
+    tempFiles: [file],
   };
 }
 

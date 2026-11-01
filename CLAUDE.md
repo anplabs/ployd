@@ -26,7 +26,8 @@ static with **no build step** (see Conventions).
 | Path | Role |
 |---|---|
 | `server/index.ts` | Express REST API + static UI host. Binds `127.0.0.1` only. |
-| `server/runner.ts` | Spawns/kills an agent CLI and streams its output. Provider-agnostic: it drives an `AgentAdapter` and reacts to normalized events (see "Agent backends"). |
+| `server/runner.ts` | Spawns/kills an agent CLI and streams its output. Provider-agnostic: it drives an `AgentAdapter` and reacts to normalized events (see "Agent backends"). With `Settings.detachedRuns` on, dispatch and Code Review runs are spawned **detached** and tailed from files, and `reattachAll()` picks them back up on boot (see "Detached runs"). |
+| `server/detached.ts` | The on-disk side of a detached run: its record under `PLOYD_DATA_DIR/runs/`, pid + start-time liveness, process-group kill, and offset tailing of its output file. Parses nothing itself. |
 | `server/agents/types.ts` | The `AgentAdapter` interface + `NormalizedEvent`/`NormalizedResult`/`PromptDelivery` — the seam that lets a task run on `claude`, `codex` or `grok`. |
 | `server/agents/claude.ts` | `ClaudeAdapter`: the `claude` CLI backend (bin, subscription env stripping, `buildArgs`/`groomArgs`, permission-bridge wiring, `stream-json` `parseLine`). A verbatim lift of the old inline runner behavior. |
 | `server/agents/codex.ts` | `CodexAdapter`: the OpenAI Codex CLI backend (`codex exec --json`, stdin prompt, sandbox/approval mapping, `OPENAI_API_KEY` stripping, JSONL `parseLine`). |
@@ -117,6 +118,48 @@ lifecycle — see "Grooming" below — and live in their own locked, leftmost co
 Dispatch runs the prompt fresh; a follow-up with an existing `sessionId` resumes the
 same session (`claude --resume`). A worktree is materialized lazily on first dispatch
 when `useWorktree` is set.
+
+With `Settings.detachedRuns` on, a `running` or `code_review` card can outlive the
+server: on boot it is reattached to its still-live process, or settled from the output
+the run left behind (see "Detached runs"). Either way the status is still set only by
+the runner.
+
+## Detached runs: task runs that survive a server restart
+
+Opt-in (`Settings.detachedRuns`, default **off**, a strict boolean in
+`PATCH /api/settings`, toggle in Settings → General → Concurrency). Off means
+byte-for-byte the old pipe spawn. Spec: `docs/specs/detached-runner.md`.
+
+- **Scope:** `runner.dispatch` and `runner.codeReview` only (they pass `detach` to
+  `launch()`). Grooming, orchestration, Ask and memory distillation stay attached. The
+  setting is read when a run starts; a run keeps the mode it started in.
+- **Spawn:** `launchDetached` starts the CLI with `detached: true` (its own process
+  group). Stdin is a prompt file, stdout/stderr are files in
+  `PLOYD_DATA_DIR/runs/<taskId>-<n>/` — never pipes, so a dead server can't SIGPIPE it.
+  `run.json` there records pid, process start time (`ps -o lstart=`), paths, read
+  offsets, temp files (Grok's prompt file), the review's implementing session id, and
+  `stopped`.
+- **Watching:** the file is polled (250 ms) and every complete line goes through the
+  same `streamInto` handlers the pipe path uses, so the log, ledger and SSE are
+  identical. The offset is written after each batch, and db.json is flushed first when
+  a line changed the task, so nothing is parsed twice and the offset is never ahead of
+  the task.
+- **Outcome:** decided from the stream (a result event) plus a recorded stop — never a
+  signal or exit code, because after a restart the server isn't the parent and can't
+  read one. Both paths of a detached run agree. A detached run killed by a signal
+  nobody sent through Ployd is therefore `failed`, not "stopped by user".
+- **Boot:** `reattachAll()` runs in `index.start()` *before* listening. It replays the
+  already-handled lines for state only (open subagents, a result already seen), then
+  either reattaches (pid alive **and** start time matches) or finishes the run from
+  the rest of the file. It runs whatever the setting says now — a record describes a
+  real detached process.
+- **Stop / quit:** `stop` signals the process **group** (`kill(-pid)`), before and
+  after a restart. `runner.shutdown()` (Electron `before-quit`, dev-server SIGINT)
+  leaves detached runs alone when the setting is on, and is `stopAll()` otherwise.
+- **Windows:** no process groups to signal, so runs stay attached there even with the
+  setting on (the settings checkbox is disabled with a note).
+- The record folder is removed only after the task's final state is flushed to
+  db.json, so a crash mid-finish just finishes it again on the next boot.
 
 ## Code Review: grading the branch before a human looks at it
 
@@ -422,6 +465,12 @@ The wiring:
   `{ behavior:'deny', message }`. Unanswered prompts auto-deny after 30 minutes; a
   stopped/exited run (`runner` exit → `permissions.rejectForTask`) or a dropped bridge
   connection (`res` close) denies any still pending.
+- **Through a restart.** A detached run (see "Detached runs") outlives the server, so the
+  bridge retries a refused/reset POST with backoff (1 s doubling to 10 s) for up to the
+  same 30 minutes, then denies. A retried POST simply re-registers the prompt on the new
+  server. Limitation: the bridge only knows the URL it was started with — a server that
+  comes back on another port of the ladder is never found. The bridge exits when its
+  stdin closes, so it can't linger retrying for a dead run.
 - Pending prompts are **process-local and never persisted** — they only make sense while
   the `claude` child is alive. `GET /api/state` annotates each task with its live
   `pendingPermissions` so a reconnecting board rebuilds the prompts.
@@ -1048,7 +1097,12 @@ respect the invariants above, run lint + test, and summarize the diff and any ri
   without it, the Windows installer registers a second "Ployd" next to the old one
   instead of upgrading it. Never change or drop `nsis.guid`.
 - Orphaned `running` tasks from a crash are auto-marked `failed` on server start
-  (`store.js`) — don't "fix" that by resurrecting them as running.
+  (`store.ts`, and orphaned `code_review` ones parked in `validation`) — don't "fix"
+  that by resurrecting them as running. The one exception is a task with a detached
+  run record in `PLOYD_DATA_DIR/runs/`: `store.ts` leaves it as it is and
+  `runner.reattachAll()` decides, from the process (pid + start time) and its output
+  file, whether to reattach it, finish it from the result it left, or fail it. A task
+  with no record keeps the old rule.
 - `db.json` is written atomically (temp file + rename) and debounced; go through
   `store.save()` rather than writing it directly.
 - The packaged app runs from a read-only bundle — never write inside the app dir; use

@@ -39,6 +39,12 @@ function renderSessionMemorySetting() {
   const value = state.settings.sessionMemoryMb;
   $('#setting-session-memory').value = value === undefined || value === 'auto' ? 'auto' : String(value);
   $('#setting-isolate-mcp').checked = state.settings.isolateMcpServers !== false;
+  // Detached runs: a POSIX feature, so on Windows the box is shown disabled
+  // with the line that says why (the server ignores the setting there anyway).
+  const supported = state.settings.detachedRunsSupported !== false;
+  $('#setting-detached-runs').checked = supported && !!state.settings.detachedRuns;
+  $('#setting-detached-runs').disabled = !supported;
+  $('#setting-detached-runs-windows').hidden = supported;
 }
 
 // `section` may be a string ('general' | 'plugins') or a DOM event (from the

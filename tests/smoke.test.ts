@@ -163,6 +163,34 @@ test('index: PATCH /api/settings sanitizes custom models — drops invalid rows 
   }
 });
 
+test('index: PATCH /api/settings takes detachedRuns as a strict boolean (default off)', async () => {
+  const store = require('../server/store');
+  const index = require('../server/index');
+  const prev = store.db.settings.detachedRuns;
+  const { server, port } = await index.start(0);
+  const patch = (body: unknown) => fetch(`http://127.0.0.1:${port}/api/settings`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  try {
+    const initial = await (await fetch(`http://127.0.0.1:${port}/api/settings`)).json();
+    assert.strictEqual(initial.detachedRuns, false, 'off by default');
+    assert.strictEqual(initial.detachedRunsSupported, process.platform !== 'win32', 'the board learns whether it can work here');
+
+    const on = await patch({ detachedRuns: true });
+    assert.strictEqual(on.status, 200);
+    assert.strictEqual((await on.json()).detachedRuns, true);
+
+    const bad = await patch({ detachedRuns: 'yes' });
+    assert.strictEqual(bad.status, 400, 'a non-boolean is rejected, not coerced');
+    assert.strictEqual(store.db.settings.detachedRuns, true, 'and leaves the setting as it was');
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    store.db.settings.detachedRuns = prev;
+  }
+});
+
 test('runner: a task on a custom model layers its env onto the child but never restores ANTHROPIC_API_KEY', () => {
   const store = require('../server/store');
   const runner = require('../server/runner');

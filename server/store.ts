@@ -16,6 +16,9 @@ const LOGS_DIR = path.join(DATA_DIR, 'logs');
 // per-task NDJSON logs so reading it for a dashboard never has to replay every
 // task's full tool-call/assistant-text history.
 const USAGE_PATH = path.join(DATA_DIR, 'usage.ndjson');
+// Detached task runs (see server/detached.ts): one folder per live run, holding
+// its record and its output files. Empty unless Settings.detachedRuns is on.
+const RUNS_DIR = path.join(DATA_DIR, 'runs');
 
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 
@@ -29,6 +32,10 @@ const DEFAULT_SETTINGS: Settings = {
   // tasks moving without starving one run of CPU or hitting subscription rate
   // limits on a typical dev laptop. Configurable in Settings.
   maxParallelSessions: 3,
+  // Off by default: task runs stay children of the server, exactly as before.
+  // When on, dispatch and Code Review runs are spawned detached so they survive
+  // a server restart (docs/specs/detached-runner.md). Never on Windows.
+  detachedRuns: false,
   installedPlugins: [],
   // Traditional merge commit, matching `gh pr merge`'s own default.
   mergeStrategy: 'merge',
@@ -98,13 +105,34 @@ if (db.settings.installedPlugins.includes('hive')) {
   db.settings.installedPlugins = db.settings.installedPlugins.map((p) => (p === 'hive' ? 'orchestration' : p));
 }
 
+// The tasks that have a detached run record on disk (server/detached.ts). Read
+// once at load: these are the only `running` / `code_review` tasks that are not
+// orphans — runner.reattachAll() decides their outcome from the process and its
+// output file instead.
+function runRecordTaskIds(): Set<string> {
+  const ids = new Set<string>();
+  let names: string[] = [];
+  try { names = fs.readdirSync(RUNS_DIR); } catch { return ids; }
+  for (const name of names) {
+    try {
+      const rec = JSON.parse(fs.readFileSync(path.join(RUNS_DIR, name, 'run.json'), 'utf8'));
+      if (rec && typeof rec.taskId === 'string' && typeof rec.pid === 'number') ids.add(rec.taskId);
+    } catch { /* unreadable: detached.listRecords() removes it */ }
+  }
+  return ids;
+}
+const tasksWithRunRecord = runRecordTaskIds();
+
 // Bring one persisted task up to date with the current schema. Any task marked
 // running when the server starts is an orphan from a previous run — its child
-// claude process died with the server. Older db.json files may still carry the
-// legacy per-task 'grooming' status; treat those the same way.
-function migrateTask(t: Task): void {
+// claude process died with the server — UNLESS it has a detached run record:
+// a detached run may still be going, or may have finished while the server was
+// down, so it is left as it is for runner.reattachAll(). Older db.json files may
+// still carry the legacy per-task 'grooming' status; treat those as orphans.
+function migrateTask(t: Task, hasRunRecord: boolean = tasksWithRunRecord.has(t.id)): void {
   // Tasks created before the pluggable-agent backend default to Claude.
   if (!t.agent) t.agent = 'claude';
+  if ((t.status === 'running' || t.status === 'code_review') && hasRunRecord) return;
   if (t.status === 'running' || (t.status as string) === 'grooming') {
     t.status = 'failed';
     t.lastOutcome = 'error';
@@ -149,14 +177,29 @@ for (const o of db.orchestrations) {
 }
 
 let saveTimer: NodeJS.Timeout | null = null;
+function writeDb(): void {
+  const tmp = DB_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+  fs.renameSync(tmp, DB_PATH);
+}
 function save(): void {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    const tmp = DB_PATH + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-    fs.renameSync(tmp, DB_PATH);
+    writeDb();
   }, 50);
+}
+
+// Write db.json now instead of on the debounce. For the few places that must
+// know the change is on disk before they do the next thing — a detached run
+// moving its read offset past a line that changed the task, or deleting its run
+// record once the task's final state is saved (see server/runner.ts).
+function flush(): void {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  writeDb();
 }
 
 function id(): string {
@@ -240,6 +283,6 @@ function readUsage(): UsageEntry[] {
 }
 
 export {
-  db, save, id, now, appendLog, readLog, removeLog, logPath, getTask, getRepo, getGrooming, getOrchestration, migrateTask,
-  DATA_DIR, DEFAULT_SETTINGS, appendUsage, readUsage, usageLogExists, touchUsageLog,
+  db, save, flush, id, now, appendLog, readLog, removeLog, logPath, getTask, getRepo, getGrooming, getOrchestration, migrateTask,
+  DATA_DIR, RUNS_DIR, DEFAULT_SETTINGS, appendUsage, readUsage, usageLogExists, touchUsageLog,
 };

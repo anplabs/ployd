@@ -51,6 +51,11 @@ export interface Settings {
   // combined) may be alive at once. Dispatch/groom reject once the cap is hit
   // rather than queuing — see runner.runningCount and index.ts's atCapacity.
   maxParallelSessions: number;
+  // When on, task dispatch and Code Review runs are spawned detached (their own
+  // process group, output to files under PLOYD_DATA_DIR/runs) so they survive a
+  // server restart and are reattached on boot. Off by default. Ignored on
+  // Windows, where runs always stay attached. See docs/specs/detached-runner.md.
+  detachedRuns: boolean;
   // Ids of plugins the user installed from the marketplace (see server/plugins.ts).
   // A plugin's features (e.g. the "From Linear" import) only surface once it's here.
   installedPlugins: string[];
@@ -133,6 +138,9 @@ export interface PublicSettings {
   sounds: boolean;
   linearConfigured: boolean;
   maxParallelSessions: number;
+  detachedRuns: boolean;
+  // False on Windows, where detachedRuns has no effect (runs stay attached).
+  detachedRunsSupported: boolean;
   installedPlugins: string[];
   mergeStrategy: MergeStrategy;
   autoResolveConflicts: boolean;
