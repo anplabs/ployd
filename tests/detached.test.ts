@@ -128,8 +128,15 @@ function spawnDetached(taskId: string, prompt: string, extra: Record<string, unk
   return { rec, child };
 }
 
+// spawnDetached unrefs the child, as a real detached run's server would. While a
+// test waits on its exit, ref it again: otherwise nothing keeps the event loop
+// alive, and Node 20's test runner cancels the test (and every one after it)
+// with "Promise resolution is still pending but the event loop has already
+// resolved". Node 22+ happens to wait, which is how this passed locally.
 function exited(child: import('child_process').ChildProcess): Promise<void> {
-  return new Promise((r) => (child.exitCode !== null || child.signalCode !== null ? r() : child.once('exit', () => r())));
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  child.ref();
+  return new Promise((r) => child.once('exit', () => { child.unref(); r(); }));
 }
 
 test('detached: liveness needs the pid AND its start time to match', async () => {
