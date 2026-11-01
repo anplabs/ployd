@@ -624,7 +624,7 @@ app.on('before-quit', () => {
   isQuitting = true;
   try {
     server.runner.stopAll(); // terminate any live claude processes
-    server.terminal.closeAll(); // kill any in-app shell sessions
+    server.terminal.closeAll(); // save the open shell sessions (restored on next boot), then kill them
   } catch (_) { /* nothing to stop */ }
 });
 

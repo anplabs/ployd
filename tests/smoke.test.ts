@@ -3729,6 +3729,112 @@ test('terminal: a command session types its command at the prompt and keeps a pl
   }
 });
 
+// Collects a session's replayed output (the buffer attach() hands a new client).
+function replayOf(terminal: { attach: (id: string, fn: (b64: string) => void) => (() => void) | null }, sid: string): string {
+  let out = '';
+  const off = terminal.attach(sid, (b64) => { out += Buffer.from(b64, 'base64').toString('utf8'); });
+  if (off) off();
+  return out;
+}
+
+test('terminal: live sessions survive a restart as plain shells with the same id and label', async () => {
+  const store = require('../server/store');
+  const terminal = require('../server/terminal');
+  const index = require('../server/index');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  const repo = { id: 'restore-r1', name: 'restore', path: dir };
+  store.db.repos.push(repo);
+  try {
+    // Start from nothing open and nothing saved.
+    terminal.closeAll();
+    terminal.flushSaved();
+    const shell = terminal.create({ cwd: dir, repoId: repo.id });
+    const agent = terminal.create({ cwd: dir, repoId: repo.id, kind: 'claude' });
+    const script = terminal.create({ cwd: dir, repoId: repo.id, command: 'npm run dev' });
+    const gone = terminal.create({ cwd: dir, repoId: repo.id });
+    terminal.close(gone.id); // exited: its tab is red, and it must not come back
+    terminal.flushSaved();
+
+    const ids = (rows: Array<{ id: string }>) => rows.map((r) => r.id).sort();
+    const mine = [shell.id, agent.id, script.id].sort();
+    assert.deepStrictEqual(ids(terminal.readSaved()), mine, 'only live sessions are saved; the exited one is not');
+
+    // Shutdown kills every shell, but those deaths are the server going away:
+    // the saved list must still hold what was open.
+    terminal.closeAll();
+    assert.deepStrictEqual(terminal.list().filter((s: { repoId: string }) => s.repoId === repo.id), [], 'all gone in memory');
+    assert.deepStrictEqual(ids(terminal.readSaved()), mine, 'closeAll keeps the saved list intact');
+
+    const restored = await index._restoreTerminalSessions();
+    assert.deepStrictEqual(ids(restored), mine, 'every saved session comes back under its old id');
+    const byId = new Map(terminal.list().map((s: { id: string }) => [s.id, s]));
+    for (const sid of mine) {
+      const s = byId.get(sid) as { kind: string; command?: string; cwd: string; status: string };
+      assert.ok(s, 'listed again');
+      assert.strictEqual(s.kind, 'shell', 'a restored session is a plain shell, whatever it was before');
+      assert.strictEqual(s.command, undefined, 'and nothing is re-run in it');
+      assert.strictEqual(s.cwd, dir, 'at the same checkout');
+    }
+    assert.strictEqual((byId.get(agent.id) as { label: string }).label, 'Claude', 'the label is kept');
+    assert.strictEqual((byId.get(script.id) as { label: string }).label, 'npm run dev', 'a script label is kept too');
+
+    const agentOut = replayOf(terminal, agent.id);
+    assert.ok(agentOut.startsWith('\x1b[2mRestored after restart. The previous Claude session ended.'),
+      'the pane opens with a dim notice saying the agent did not come back');
+    assert.match(replayOf(terminal, script.id), /"npm run dev" was not restarted/);
+    assert.ok(replayOf(terminal, shell.id).startsWith('\x1b[2mRestored after restart.\x1b[0m'), 'a plain shell gets the short notice');
+
+    // Numbering still knows about the restored "Claude": the next one is "Claude 2".
+    const next = terminal.create({ cwd: dir, repoId: repo.id, kind: 'claude' });
+    assert.strictEqual(next.label, 'Claude 2', 'a new session is numbered after the restored ones');
+  } finally {
+    terminal.closeAll();
+    store.db.repos = store.db.repos.filter((r: { id: string }) => r.id !== repo.id);
+    terminal.flushSaved();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('terminal: restore skips a saved session whose checkout no longer resolves', async () => {
+  const store = require('../server/store');
+  const terminal = require('../server/terminal');
+  const index = require('../server/index');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  const deleted = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  fs.rmSync(deleted, { recursive: true, force: true });
+  const repo = { id: 'restore-r2', name: 'restore', path: dir };
+  const gonePathRepo = { id: 'restore-r3', name: 'gone', path: deleted };
+  store.db.repos.push(repo, gonePathRepo);
+  const row = (sid: string, repoId: string, cwd: string) => ({
+    id: sid, repoId, cwd, kind: 'shell', label: 'Shell', base: 'Shell', createdAt: new Date().toISOString(),
+  });
+  try {
+    terminal.closeAll();
+    fs.writeFileSync(terminal.SAVED_PATH, JSON.stringify({
+      version: 1,
+      sessions: [
+        row('aaaaaaaaaa', repo.id, dir), // fine: the repo root
+        row('bbbbbbbbbb', 'no-such-repo', dir), // repo unregistered
+        row('cccccccccc', repo.id, elsewhere), // not a checkout of this repo (no such worktree)
+        row('dddddddddd', gonePathRepo.id, deleted), // the directory itself is gone
+        { id: 'eeeeeeeeee', repoId: repo.id, cwd: dir, kind: 'bash', label: 'x' }, // malformed
+      ],
+    }));
+    const restored = await index._restoreTerminalSessions();
+    assert.deepStrictEqual(restored.map((s: { id: string }) => s.id), ['aaaaaaaaaa'], 'only the valid checkout is restored');
+    assert.deepStrictEqual(terminal.list().map((s: { id: string }) => s.id), ['aaaaaaaaaa'], 'no shell was opened anywhere else');
+    assert.deepStrictEqual(terminal.readSaved().map((s: { id: string }) => s.id), ['aaaaaaaaaa'],
+      'skipped rows are dropped from the saved list');
+  } finally {
+    terminal.closeAll();
+    store.db.repos = store.db.repos.filter((r: { id: string }) => r.id !== repo.id && r.id !== gonePathRepo.id);
+    terminal.flushSaved();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
 test('repoSettings: sanitize drops unknown keys, invalid values and empty strings', () => {
   const repoSettings = require('../server/repoSettings');
 
