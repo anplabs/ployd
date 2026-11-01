@@ -826,299 +826,407 @@
     </div>
   </div>
 
-  <!-- Settings modal (ChatGPT-desktop style: header bar + sidebar nav + content pane) -->
+  <!-- Settings modal, laid out like shadcn/ui's settings dialog: a sidebar
+       (title + section nav) beside a content pane whose header (the active
+       section's name + close) stays put while the body scrolls. Each section is
+       a stack of groups; a group is a small heading over one card of rows, and a
+       row is a label + description on the left with its control on the right
+       (shadcn's horizontal Field). Toggles are switches (checkboxes underneath,
+       so the feature modules still read `.checked`). -->
   <div id="modal-settings" class="modal hidden">
-    <div class="modal-box settings-box">
-      <div class="settings-head">
-        <h2 class="settings-title">Settings</h2>
-        <button class="btn icon settings-close" id="settings-close" title="Close" aria-label="Close"><span class="i" data-icon="x"></span></button>
-      </div>
-      <div class="settings-layout">
+    <div class="modal-box settings-box" role="dialog" aria-modal="true" aria-labelledby="settings-section-title">
+      <aside class="settings-sidebar">
+        <div class="settings-sidebar-head">
+          <span class="settings-title">Settings</span>
+        </div>
         <nav class="settings-nav" aria-label="Settings sections">
-          <button class="settings-nav-item active" data-section="general">
-            <span class="i" data-icon="sliders-horizontal"></span>General
+          <button class="settings-nav-item active" data-section="general" aria-current="page">
+            <span class="i" data-icon="sliders-horizontal"></span><span>General</span>
           </button>
           <button class="settings-nav-item" data-section="git">
-            <span class="i" data-icon="git-branch"></span>Git
+            <span class="i" data-icon="git-branch"></span><span>Git</span>
           </button>
           <button class="settings-nav-item" data-section="models">
-            <span class="i" data-icon="cpu"></span>Models
+            <span class="i" data-icon="cpu"></span><span>Models</span>
           </button>
           <button class="settings-nav-item" data-section="usage">
-            <span class="i" data-icon="bar-chart-3"></span>Usage
+            <span class="i" data-icon="bar-chart-3"></span><span>Usage</span>
           </button>
           <button class="settings-nav-item" data-section="remote">
-            <span class="i" data-icon="wifi"></span>Remote Access
+            <span class="i" data-icon="wifi"></span><span>Remote Access</span>
           </button>
           <button class="settings-nav-item" data-section="plugins">
-            <span class="i" data-icon="puzzle"></span>Plugins
+            <span class="i" data-icon="puzzle"></span><span>Plugins</span>
           </button>
         </nav>
+      </aside>
+      <div class="settings-content">
+        <header class="settings-header">
+          <h2 class="settings-section-title" id="settings-section-title">General</h2>
+          <button class="btn icon settings-close" id="settings-close" title="Close" aria-label="Close"><span class="i" data-icon="x"></span></button>
+        </header>
         <div class="settings-main">
           <section class="settings-section" data-section="general">
-            <h2 class="settings-section-title">General</h2>
-            <fieldset class="addons">
-              <legend>Appearance</legend>
-              <label>Theme <span class="field-hint">— follow your OS, or pin one</span>
-                <select id="setting-theme">
-                  <option value="system">System</option>
-                  <option value="light">Light</option>
-                  <option value="dark">Dark</option>
-                </select>
-              </label>
-              <label>Color theme <span class="field-hint">— each one has a light and a dark side</span>
-                <select id="setting-palette">
-                  <option value="paper">Paper</option>
-                  <option value="graphite">Graphite</option>
-                  <option value="nord">Nord</option>
-                  <option value="solarized">Solarized</option>
-                  <option value="rose-pine">Rosé Pine</option>
-                </select>
-              </label>
-              <label>Layout <span class="field-hint">— how the board is framed</span>
-                <select id="setting-layout">
-                  <option value="sidebar">Project sidebar</option>
-                  <option value="classic">Classic board</option>
-                </select>
-              </label>
-              <p class="addon-hint"><strong>Project sidebar</strong> is the default: a left rail shows which agents need you,
-                which are working and which just finished, above every repository, and projects and shell sessions open as tabs beside it, so
-                you can jump between them without leaving the board. <strong>Classic board</strong> is the older shape —
-                the Super View grid plus one repo's Kanban board at a time, with the terminal docked at the bottom. The
-                board itself is the same either way.</p>
-              <p class="addon-hint">All three are remembered on this device (in the browser, not in <code>db.json</code>), so
-                the desktop app and a phone on the LAN can each use their own.</p>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Notifications</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-notifications" />
-                <span class="addon-text">
-                  <span class="addon-label">Desktop notifications</span>
-                  <span class="addon-hint">Get a system notification when a task finishes, fails, or an idea is groomed.</span>
-                </span>
-              </label>
-              <p class="addon-hint" id="setting-notif-note"></p>
-              <button class="btn ghost" id="setting-notif-test">Send a test notification</button>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Sounds</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-sounds" />
-                <span class="addon-text">
-                  <span class="addon-label">Sound cues</span>
-                  <span class="addon-hint">Play a short chime when a task finishes or a tool needs your approval.</span>
-                </span>
-              </label>
-              <button class="btn ghost" id="setting-sound-test">Play a test sound</button>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Concurrency</legend>
-              <label>Max parallel sessions <span class="field-hint">— dispatched runs + grooming sessions combined</span>
-                <input id="setting-max-parallel" type="number" min="1" max="20" step="1" />
-              </label>
-              <p class="addon-hint">Caps how many agent sessions run at once so they don't starve each other of CPU. 3 is a good default on a typical laptop.</p>
-              <label>Per-session memory budget <span class="field-hint">— how much RAM one agent session may size itself against</span>
-                <select id="setting-session-memory">
-                  <option value="auto">Auto</option>
-                  <option value="1024">1 GB</option>
-                  <option value="2048">2 GB</option>
-                  <option value="4096">4 GB</option>
-                  <option value="6144">6 GB</option>
-                  <option value="8192">8 GB</option>
-                  <option value="0">No budget</option>
-                </select>
-              </label>
-              <p class="addon-hint">The <code>claude</code> CLI grows its memory to fit the machine it thinks it has,
-                so several parallel sessions each plan to use all of it — which is how a busy board ends up swapping
-                and freezing. This hands each session a budget instead. <strong>Auto</strong> divides a share of this
-                machine's RAM by the cap above.</p>
-              <label class="check addon">
-                <input type="checkbox" id="setting-detached-runs" />
-                <span class="addon-text">
-                  <span class="addon-label">Keep task runs going when Ployd quits or restarts</span>
-                  <span class="addon-hint">Task runs and code reviews run as their own background processes and write
-                    their output to files, so quitting the app, a crash or relaunching for an update no longer kills
-                    them — Ployd picks them back up when it starts again, and finishes any that ended while it was
-                    away. Applies to runs started after you turn it on. Grooming, orchestration and Ask still stop with
-                    the app. <span id="setting-detached-runs-windows">Not available on Windows: runs there always stop
-                    with the app.</span></span>
-                </span>
-              </label>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Agent isolation</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-isolate-mcp" />
-                <span class="addon-text">
-                  <span class="addon-label">Don't load my own MCP servers into agent sessions</span>
-                  <span class="addon-hint">Every session Ployd spawns otherwise connects to all the MCP servers
-                    your <code>claude</code> install is configured with — a child process each for local ones, plus
-                    every one of their tools described in every request. Sessions still get the servers Ployd
-                    registers itself (tool approvals, and the board tools an orchestration drives). Turn this off if
-                    a task genuinely needs your own MCP servers.</span>
-                </span>
-              </label>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Resource monitor</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-resource-monitor" />
-                <span class="addon-text">
-                  <span class="addon-label">Show live CPU &amp; memory usage</span>
-                  <span class="addon-hint">Adds a chip to the top bar with what Ployd and the agent sessions it
-                    spawned are costing this machine right now — click it for a per-session breakdown. Off by
-                    default because it polls the OS process table; nothing is sampled while it's off, and nothing
-                    leaves your machine.</span>
-                </span>
-              </label>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Project memory</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-memory" />
-                <span class="addon-text">
-                  <span class="addon-label">Distill learnings after each finished task</span>
-                  <span class="addon-hint">After a task finishes successfully, a short read-only session (on a
-                    cheap fixed model) reviews what changed and folds any durable, project-level learning into
-                    a private per-repo memory document — viewable from a workspace's <strong>Memory</strong>
-                    button. Injected into "Brief an Idea" sessions for context.</span>
-                </span>
-              </label>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Terminal sessions</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-notify-sessions" />
-                <span class="addon-text">
-                  <span class="addon-label">Tell a session's agent when its tasks land</span>
-                  <span class="addon-hint">When the agent in a terminal session (Claude, Codex or Grok) creates a
-                    task over Ployd's MCP server, Ployd types one line into that session once the task reaches
-                    Validation, Failed or Done, so the agent reads the result without you copying it over. It
-                    waits until the session is idle, you have nothing half-typed and no menu or yes/no prompt is
-                    open, and never types into a plain shell. Claude sessions started here get Ployd's board tools automatically.</span>
-                </span>
-              </label>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>External tools</legend>
-              <label>Default IDE <span class="field-hint">— opened by a workspace's <strong>Open in IDE</strong> button</span>
-                <select id="setting-default-editor">
-                  <option value="">Ask me each time</option>
-                </select>
-              </label>
-              <p class="addon-hint" id="setting-editor-note">Ployd hands the repository (or worktree) folder to the
-                editor's command-line launcher — <code>code</code> for VS Code, <code>idea</code>/<code>webstorm</code>/… for
-                JetBrains IDEs — and falls back to the installed app on macOS. Editors it can't find on this machine are
-                listed as unavailable.</p>
-              <button class="btn ghost" id="setting-editor-rescan"><span class="i" data-icon="rotate-cw"></span>Rescan for editors</button>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Session agents</legend>
-              <p class="addon-hint">Your own agent commands for terminal sessions, offered in the new-session picker
-                after Claude, Codex and Grok — <code>aider</code>, <code>opencode</code>, <code>gemini</code>,
-                <code>claude --model opus</code>. The command is typed at a fresh shell's prompt on the checkout, as if
-                you had typed it yourself, so quitting the agent leaves you at a live prompt. One line, no secrets.</p>
-              <div id="session-agents-body" class="session-agents-body"></div>
-              <div class="session-agent-row session-agent-add">
-                <input id="session-agent-add-label" type="text" maxlength="40" placeholder="Name, e.g. Aider" aria-label="New agent name" />
-                <input id="session-agent-add-command" class="mono" type="text" maxlength="500" placeholder="Command, e.g. aider --model sonnet" aria-label="New agent command" />
-                <button class="btn" id="session-agent-add-btn"><span class="i" data-icon="plus"></span>Add</button>
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Appearance</h3>
+                <p class="settings-group-desc">Saved on this device (in the browser, not in <code>db.json</code>), so the
+                  desktop app and a phone on the LAN can each keep their own.</p>
               </div>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Pull requests</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-auto-resolve-conflicts" />
-                <span class="addon-text">
-                  <span class="addon-label">Auto-resolve conflicts</span>
-                  <span class="addon-hint">When a task's PR has merge conflicts with main, automatically resume its
-                    session to resolve them — the card moves back to Running with a "Resolving Conflicts" label,
-                    then follows the normal lifecycle back to Validation. Also used by Autonomous Mode.</span>
-                </span>
-              </label>
-              <label class="check addon">
-                <input type="checkbox" id="setting-assign-pr-to-self" />
-                <span class="addon-text">
-                  <span class="addon-label">Assign to me</span>
-                  <span class="addon-hint">When the "Create a Pull Request at the end" add-on opens a pull request,
-                    assign it to your logged-in <code>gh</code> user automatically.</span>
-                </span>
-              </label>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>About</legend>
-              <p class="addon-hint" id="setting-about-version">Ployd</p>
-            </fieldset>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-theme">Theme</label>
+                    <p class="settings-row-desc">Follow your OS, or pin one.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <select id="setting-theme">
+                      <option value="system">System</option>
+                      <option value="light">Light</option>
+                      <option value="dark">Dark</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-palette">Color theme</label>
+                    <p class="settings-row-desc">Each one has a light and a dark side.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <select id="setting-palette">
+                      <option value="paper">Paper</option>
+                      <option value="graphite">Graphite</option>
+                      <option value="nord">Nord</option>
+                      <option value="solarized">Solarized</option>
+                      <option value="rose-pine">Rosé Pine</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-layout">Layout</label>
+                    <p class="settings-row-desc"><strong>Project sidebar</strong> shows a left rail with the agents that
+                      need you, are working or just finished, above every repository, and opens projects and shells as
+                      tabs. <strong>Classic board</strong> shows the Super View grid
+                      and one board at a time, with the terminal docked at the bottom.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <select id="setting-layout">
+                      <option value="sidebar">Project sidebar</option>
+                      <option value="classic">Classic board</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Notifications &amp; sounds</h3>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-notifications">Desktop notifications</label>
+                    <p class="settings-row-desc">Get a system notification when a task finishes, fails, or an idea is groomed.</p>
+                    <p class="settings-row-desc" id="setting-notif-note"></p>
+                  </div>
+                  <div class="settings-row-control settings-row-actions">
+                    <button class="btn ghost" id="setting-notif-test">Test</button>
+                    <input type="checkbox" class="switch" role="switch" id="setting-notifications" />
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-sounds">Sound cues</label>
+                    <p class="settings-row-desc">Play a short chime when a task finishes or a tool needs your approval.</p>
+                  </div>
+                  <div class="settings-row-control settings-row-actions">
+                    <button class="btn ghost" id="setting-sound-test">Test</button>
+                    <input type="checkbox" class="switch" role="switch" id="setting-sounds" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Performance</h3>
+                <p class="settings-group-desc">Limits that keep parallel agent sessions from starving this machine.</p>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-max-parallel">Max parallel sessions</label>
+                    <p class="settings-row-desc">Dispatched runs and grooming sessions combined. 3 suits a typical laptop.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input id="setting-max-parallel" class="settings-number" type="number" min="1" max="20" step="1" />
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-session-memory">Per-session memory budget</label>
+                    <p class="settings-row-desc">The <code>claude</code> CLI sizes its memory to the whole machine, so
+                      parallel sessions each plan to use all of it and the board starts swapping. A budget prevents
+                      that. <strong>Auto</strong> divides a share of this machine's RAM by the cap above.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <select id="setting-session-memory">
+                      <option value="auto">Auto</option>
+                      <option value="1024">1 GB</option>
+                      <option value="2048">2 GB</option>
+                      <option value="4096">4 GB</option>
+                      <option value="6144">6 GB</option>
+                      <option value="8192">8 GB</option>
+                      <option value="0">No budget</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-detached-runs">Keep task runs going when Ployd quits or restarts</label>
+                    <p class="settings-row-desc">Task runs and code reviews run as their own background processes and
+                      write their output to files, so a quit, a crash or an update relaunch no longer kills them. Ployd
+                      picks them up again when it starts, and finishes any that ended while it was away. Applies to runs
+                      started after you turn it on. Grooming, orchestration and Ask still stop with the app.
+                      <span id="setting-detached-runs-windows">Not available on Windows: runs there always stop with
+                      the app.</span></p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-detached-runs" />
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-isolate-mcp">Isolate agent sessions from my MCP servers</label>
+                    <p class="settings-row-desc">Otherwise every session connects to all the MCP servers your
+                      <code>claude</code> install uses, with a child process for each local one. Sessions still get
+                      the servers Ployd registers itself. Turn this off if a task needs your own servers.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-isolate-mcp" />
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-resource-monitor">Resource monitor</label>
+                    <p class="settings-row-desc">Adds a top-bar chip with the CPU and memory that Ployd and its agent
+                      sessions use right now. It polls the OS process table only while it is on, and nothing leaves
+                      your machine.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-resource-monitor" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Workflow</h3>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-memory">Project memory</label>
+                    <p class="settings-row-desc">After a task succeeds, a short read-only session on a cheap model
+                      folds durable learnings into a private per-repo memory document. View it from a workspace's
+                      <strong>Memory</strong> item. "Brief an Idea" sessions read it for context.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-memory" />
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-auto-resolve-conflicts">Auto-resolve PR conflicts</label>
+                    <p class="settings-row-desc">When a task's PR conflicts with main, resume its session to resolve
+                      them. The card goes back to Running, then returns to Validation. Autonomous Mode uses this too.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-auto-resolve-conflicts" />
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-assign-pr-to-self">Assign pull requests to me</label>
+                    <p class="settings-row-desc">When the "Create a Pull Request" add-on opens a PR, assign it to your
+                      logged-in <code>gh</code> user.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-assign-pr-to-self" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Terminal sessions</h3>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-notify-sessions">Tell a session's agent when its tasks land</label>
+                    <p class="settings-row-desc">When the agent in a terminal session (Claude, Codex or Grok) creates a
+                      task over Ployd's MCP server, Ployd types one line into that session once the task reaches
+                      Validation, Failed or Done. It waits until the session is idle, nothing is half-typed and no menu
+                      or yes/no prompt is open, and it never types into a plain shell. Claude sessions started here get
+                      Ployd's board tools automatically.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-notify-sessions" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Session agents</h3>
+                <p class="settings-group-desc">Your own agent commands for terminal sessions, offered in the
+                  new-session picker after Claude, Codex and Grok: <code>aider</code>, <code>opencode</code>,
+                  <code>gemini</code>, <code>claude --model opus</code>. Ployd types the command at a fresh shell's
+                  prompt on the checkout, so quitting the agent leaves you at a live prompt. One line, no secrets.</p>
+              </div>
+              <div class="settings-card settings-form">
+                <div id="session-agents-body" class="session-agents-body"></div>
+                <div class="session-agent-row session-agent-add">
+                  <input id="session-agent-add-label" type="text" maxlength="40" placeholder="Name, e.g. Aider" aria-label="New agent name" />
+                  <input id="session-agent-add-command" class="mono" type="text" maxlength="500" placeholder="Command, e.g. aider --model sonnet" aria-label="New agent command" />
+                  <button class="btn" id="session-agent-add-btn"><span class="i" data-icon="plus"></span>Add</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">External tools</h3>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-default-editor">Default IDE</label>
+                    <p class="settings-row-desc" id="setting-editor-note">Opened by a workspace's <strong>Open in
+                      IDE</strong> item. Ployd uses the editor's launcher (<code>code</code>, <code>idea</code>,
+                      <code>webstorm</code>, …) and falls back to the installed app on macOS.</p>
+                  </div>
+                  <div class="settings-row-control settings-row-actions">
+                    <button class="btn icon" id="setting-editor-rescan" title="Rescan for editors" aria-label="Rescan for editors"><span class="i" data-icon="rotate-cw"></span></button>
+                    <select id="setting-default-editor">
+                      <option value="">Ask me each time</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">About</h3>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <span class="settings-row-label">Version</span>
+                    <p class="settings-row-desc settings-mono" id="setting-about-version">Ployd</p>
+                  </div>
+                </div>
+              </div>
+            </div>
           </section>
 
           <section class="settings-section hidden" data-section="git">
-            <h2 class="settings-section-title">Git</h2>
-            <fieldset class="addons">
-              <legend>Merge strategy</legend>
-              <label>Preferred strategy <span class="field-hint">— used when merging a task's pull request</span>
-                <select id="setting-merge-strategy">
-                  <option value="merge">Merge commit</option>
-                  <option value="squash">Squash and merge</option>
-                  <option value="rebase">Rebase and merge</option>
-                </select>
-              </label>
-              <p class="addon-hint">Applies to the "Merge pull request" wrap-up step and to Autonomous Mode's own merges (<code>gh pr merge</code>).</p>
-            </fieldset>
-            <fieldset class="addons">
-              <legend>Merge grade</legend>
-              <label>Minimum code review grade <span class="field-hint">— Autonomous Mode won't merge below this</span>
-                <select id="setting-min-merge-grade">
-                  <option value="1">1 — must not be merged</option>
-                  <option value="2">2 — still not mergeable, but better than 1</option>
-                  <option value="3">3 — mergeable with reservations</option>
-                  <option value="4">4 — mergeable, only nits</option>
-                  <option value="5">5 — good to go</option>
-                </select>
-              </label>
-              <p class="addon-hint">Every finished branch is graded 1–5 by the <strong>Code Review</strong> stage (a fresh
-                read-only reviewer that comments on the PR and labels it <code>mergeable/&lt;n&gt;</code>). Autonomous Mode
-                merges only at or above this grade; anything lower is left in <strong>Validation</strong> for you.</p>
-            </fieldset>
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Merging</h3>
+                <p class="settings-group-desc">Used by the "Merge pull request" wrap-up step and by Autonomous Mode
+                  (<code>gh pr merge</code>).</p>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-merge-strategy">Merge strategy</label>
+                    <p class="settings-row-desc">How a task's pull request is merged.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <select id="setting-merge-strategy">
+                      <option value="merge">Merge commit</option>
+                      <option value="squash">Squash and merge</option>
+                      <option value="rebase">Rebase and merge</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-min-merge-grade">Minimum code review grade</label>
+                    <p class="settings-row-desc">The <strong>Code Review</strong> stage grades each branch 1–5 and labels
+                      its PR <code>mergeable/&lt;n&gt;</code>. Autonomous Mode merges only at or above this grade and
+                      leaves the rest in <strong>Validation</strong> for you.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <select id="setting-min-merge-grade">
+                      <option value="1">1 — must not be merged</option>
+                      <option value="2">2 — still not mergeable, but better than 1</option>
+                      <option value="3">3 — mergeable with reservations</option>
+                      <option value="4">4 — mergeable, only nits</option>
+                      <option value="5">5 — good to go</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
           </section>
 
           <section class="settings-section hidden" data-section="models">
-            <h2 class="settings-section-title">Models</h2>
-            <p class="muted">Add your own models on top of the built-in ones (Sonnet, Opus, Haiku,
-              Fable). They show up in every model picker — New Task, Brief an Idea, and Linear import.
-              A custom model is handed to <code>claude --model</code> as-is, and its environment
-              variables are set only for runs on that model.</p>
-            <p class="muted">Use this for an <strong>Amazon Bedrock</strong> model: set the model id
-              and add <code>CLAUDE_CODE_USE_BEDROCK=1</code> plus <code>AWS_REGION</code>. AWS
-              credentials come from your machine's environment (e.g. an <code>AWS_PROFILE</code>) —
-              don't paste secrets here. Ployd never uses an Anthropic API key
-              (<code>ANTHROPIC_API_KEY</code> is always stripped).</p>
-            <div id="settings-models-body" class="models-body"></div>
-            <fieldset class="addons" id="model-add">
-              <legend>Add a model</legend>
-              <div class="grid-2">
-                <label>Name <span class="field-hint">— shown in the picker</span>
-                  <input id="model-add-label" type="text" placeholder="e.g. Claude on Bedrock" />
-                </label>
-                <label>Model id <span class="field-hint">— passed to <code>--model</code></span>
-                  <input id="model-add-id" type="text" placeholder="e.g. us.anthropic.claude-sonnet-4-5-20250929-v1:0" />
-                </label>
+            <div class="settings-intro">
+              <p>Add your own models next to the built-in ones (Sonnet, Opus, Haiku, Fable). They show up in every
+                model picker: New Task, Brief an Idea, and Linear import. Ployd passes a custom model to
+                <code>claude --model</code> as-is and sets its environment variables only for runs on that model.</p>
+              <p>For an <strong>Amazon Bedrock</strong> model, set the model id and add
+                <code>CLAUDE_CODE_USE_BEDROCK=1</code> plus <code>AWS_REGION</code>. AWS credentials come from your
+                machine's environment (for example an <code>AWS_PROFILE</code>), so do not paste secrets here.
+                Ployd never uses an Anthropic API key (<code>ANTHROPIC_API_KEY</code> is always stripped).</p>
+            </div>
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Custom models</h3>
               </div>
-              <label>Environment variables <span class="field-hint">— one <code>KEY=value</code> per line</span>
-                <textarea id="model-add-env" rows="3" placeholder="CLAUDE_CODE_USE_BEDROCK=1&#10;AWS_REGION=us-east-1"></textarea>
-              </label>
-              <div class="remote-actions">
-                <button class="btn" id="model-add-btn"><span class="i" data-icon="plus"></span>Add model</button>
+              <div id="settings-models-body" class="models-body"></div>
+            </div>
+            <div class="settings-group" id="model-add">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Add a model</h3>
               </div>
-            </fieldset>
+              <div class="settings-card settings-form">
+                <div class="grid-2">
+                  <label>Name
+                    <input id="model-add-label" type="text" placeholder="e.g. Claude on Bedrock" />
+                    <span class="settings-field-desc">Shown in the picker.</span>
+                  </label>
+                  <label>Model id
+                    <input id="model-add-id" type="text" placeholder="e.g. us.anthropic.claude-sonnet-4-5-20250929-v1:0" />
+                    <span class="settings-field-desc">Passed to <code>--model</code>.</span>
+                  </label>
+                </div>
+                <label>Environment variables
+                  <textarea id="model-add-env" rows="3" placeholder="CLAUDE_CODE_USE_BEDROCK=1&#10;AWS_REGION=us-east-1"></textarea>
+                  <span class="settings-field-desc">One <code>KEY=value</code> per line.</span>
+                </label>
+                <div class="settings-form-actions">
+                  <button class="btn" id="model-add-btn"><span class="i" data-icon="plus"></span>Add model</button>
+                </div>
+              </div>
+            </div>
           </section>
 
           <section class="settings-section hidden" data-section="usage">
-            <h2 class="settings-section-title">Usage</h2>
-            <p class="muted">Local spend tracking, computed from every session's own cost/token
-              report — the same figures the <code>claude</code> CLI shows you, not a subscription
-              bill (Ployd never uses an API key). Codex sessions report tokens only, with no
-              dollar figure, so they show a cost of &mdash;. Nothing leaves your machine.</p>
+            <div class="settings-intro">
+              <p>Local spend, computed from each session's own cost and token report. These are the figures the
+                <code>claude</code> CLI shows you, not a subscription bill (Ployd never uses an API key). Codex
+                sessions report tokens only, so their cost shows as &mdash;. Nothing leaves your machine.</p>
+            </div>
             <div class="usage-toolbar">
               <div class="usage-period" role="group" aria-label="Period">
                 <button class="usage-period-btn" data-period="7d">7 days</button>
@@ -1126,7 +1234,7 @@
                 <button class="usage-period-btn" data-period="90d">90 days</button>
                 <button class="usage-period-btn" data-period="all">All time</button>
               </div>
-              <select id="usage-repo-filter" class="usage-repo-filter">
+              <select id="usage-repo-filter" class="usage-repo-filter" aria-label="Project">
                 <option value="">All projects</option>
               </select>
             </div>
@@ -1134,46 +1242,56 @@
           </section>
 
           <section class="settings-section hidden" data-section="remote">
-            <h2 class="settings-section-title">Remote Access (LAN)</h2>
-            <p class="muted">Open and control this board from another device on the same
-              local network — a laptop, tablet, or phone on the same Wi-Fi. The board looks
-              and works exactly like it does here.</p>
-            <fieldset class="addons">
-              <legend>Local network access</legend>
-              <label class="check addon">
-                <input type="checkbox" id="setting-remote-access" />
-                <span class="addon-text">
-                  <span class="addon-label">Enable remote access</span>
-                  <span class="addon-hint">Binds Ployd to your local network and protects it with a shared
-                    access token. Off by default; only this machine can reach it while off.</span>
-                </span>
-              </label>
+            <div class="settings-intro">
+              <p>Open and control this board from another device on the same local network, such as a laptop,
+                tablet, or phone on the same Wi-Fi. The board works the same way there.</p>
+            </div>
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Local network access</h3>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-remote-access">Enable remote access</label>
+                    <p class="settings-row-desc">Binds Ployd to your local network behind a shared access token. While
+                      it is off, only this machine can reach Ployd.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-remote-access" />
+                  </div>
+                </div>
+              </div>
               <div class="remote-warning" id="remote-warning">
                 <span class="i" data-icon="triangle-alert"></span>
                 <span>Anyone on your network who has the link and token can control your tasks and
                   repositories. Keep this off unless you need it, and only on networks you trust.
                   Traffic is unencrypted (HTTP) — LAN use only, not the public internet.</span>
               </div>
-            </fieldset>
-            <fieldset class="addons hidden" id="remote-pairing">
-              <legend>Pair a device</legend>
-              <p class="addon-hint">Open this URL from another device on the same Wi-Fi/network. The token is
-                included, so it signs in automatically.</p>
-              <div id="remote-urls" class="remote-urls"></div>
-              <p class="addon-hint hidden" id="remote-no-lan"></p>
-              <div class="remote-actions">
-                <button class="btn ghost" id="remote-regen">
-                  <span class="i" data-icon="rotate-cw"></span>Regenerate token
-                </button>
-                <span class="field-hint">Rotating the token signs out every currently-paired device.</span>
+            </div>
+            <div class="settings-group hidden" id="remote-pairing">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Pair a device</h3>
+                <p class="settings-group-desc">Open this URL from another device on the same network. It includes the
+                  token, so the device signs in automatically.</p>
               </div>
-            </fieldset>
+              <div class="settings-card settings-form">
+                <div id="remote-urls" class="remote-urls"></div>
+                <p class="settings-field-desc hidden" id="remote-no-lan"></p>
+                <div class="remote-actions">
+                  <button class="btn ghost" id="remote-regen">
+                    <span class="i" data-icon="rotate-cw"></span>Regenerate token
+                  </button>
+                  <span class="settings-field-desc">A new token signs out every paired device.</span>
+                </div>
+              </div>
+            </div>
           </section>
 
           <section class="settings-section hidden" data-section="plugins">
-            <h2 class="settings-section-title">Plugins</h2>
-            <p class="muted">Install integrations to add features to Ployd. Everything runs
-              locally with your own credentials.</p>
+            <div class="settings-intro">
+              <p>Install integrations to add features to Ployd. Everything runs locally with your own credentials.</p>
+            </div>
             <div id="settings-plugins-body" class="plugins-body"></div>
           </section>
         </div>

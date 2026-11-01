@@ -107,8 +107,9 @@ function pluginConfigHtml(p) {
     : 'Create a personal API key in Linear (Settings → Security & access → Personal API keys).';
   return `
       <div class="plugin-config">
-        <label>Personal API key <span class="field-hint">— stored locally, used to import issues</span>
+        <label>Personal API key
           <input class="plugin-key-input" type="password" placeholder="lin_api_…" autocomplete="off" />
+          <span class="settings-field-desc">Stored locally and used to import issues.</span>
         </label>
         <p class="addon-hint plugin-key-note">${esc(note)}</p>
         <div class="row">
