@@ -40,6 +40,9 @@ function renderCard(t) {
   if (badge) chips.push(`<span class="chip agent-chip" title="${badge.title}">${icon(badge.icon)} ${badge.label}</span>`);
   chips.push(`<span class="chip model${modelClass(modelName)}">${esc(modelName)}</span>`);
   if (t.groomingId) chips.push(`<span class="chip grooming-chip" title="Spawned by a grooming">${icon('lightbulb')} groomed</span>`);
+  // Created by the agent in a terminal session, which hears back when it lands
+  // (server/sessionNotify.ts). The label is the session's at creation time.
+  if (t.originSessionId) chips.push(`<span class="chip origin-chip" title="Created from the terminal session ${esc(t.originSessionLabel || '')}. Ployd types a one-line notice into it when this task lands.">${icon('terminal')} ${esc(t.originSessionLabel || 'session')}</span>`);
   if (t.resolvingConflicts) chips.push(`<span class="chip conflict-chip" title="Auto-resolving merge conflicts with main">${icon('git-branch')} Resolving Conflicts</span>`);
   if (t.useWorktree) chips.push(`<span class="chip worktree" title="${esc(t.worktreePath || 'worktree on dispatch')}">${icon('git-branch')} ${esc(t.branch || t.branchName || 'worktree')}</span>`);
   // Once a branch exists, prefer its live PR status (color-coded by

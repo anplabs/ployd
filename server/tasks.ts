@@ -72,7 +72,11 @@ type SharedField = keyof RepoSettings & keyof CreateTaskInput;
 // Create a task in `backlog` (or `ready`), persist it, and broadcast it to every
 // connected board. Throws a plain Error on invalid input; the caller maps that
 // to a 4xx (REST) or a tool error (MCP).
-export function createTask(input: CreateTaskInput): Task {
+//
+// `origin` links the task to the terminal session that asked for it (MCP
+// create_task only). The caller has already checked it names a live session;
+// it is an option rather than an input field so a request body can't set it.
+export function createTask(input: CreateTaskInput, origin?: { sessionId: string; label: string } | null): Task {
   const prompt = String(input.prompt ?? '');
   if (!prompt.trim()) throw new Error('prompt is required');
   // No title is required up front: a blank one is derived from the prompt's
@@ -136,6 +140,10 @@ export function createTask(input: CreateTaskInput): Task {
     startedAt: null,
     finishedAt: null,
   };
+  if (origin) {
+    task.originSessionId = origin.sessionId;
+    task.originSessionLabel = origin.label;
+  }
   db.tasks.push(task);
   save();
   broadcast({ type: 'task', task });

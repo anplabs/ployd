@@ -986,6 +986,20 @@
               </label>
             </fieldset>
             <fieldset class="addons">
+              <legend>Terminal sessions</legend>
+              <label class="check addon">
+                <input type="checkbox" id="setting-notify-sessions" />
+                <span class="addon-text">
+                  <span class="addon-label">Tell a session's agent when its tasks land</span>
+                  <span class="addon-hint">When the agent in a terminal session (Claude, Codex or Grok) creates a
+                    task over Ployd's MCP server, Ployd types one line into that session once the task reaches
+                    Validation, Failed or Done, so the agent reads the result without you copying it over. It
+                    waits until the session is idle, you have nothing half-typed and no menu or yes/no prompt is
+                    open, and never types into a plain shell. Claude sessions started here get Ployd's board tools automatically.</span>
+                </span>
+              </label>
+            </fieldset>
+            <fieldset class="addons">
               <legend>External tools</legend>
               <label>Default IDE <span class="field-hint">— opened by a workspace's <strong>Open in IDE</strong> button</span>
                 <select id="setting-default-editor">

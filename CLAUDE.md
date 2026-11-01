@@ -56,6 +56,7 @@ static with **no build step** (see Conventions).
 | `server/groomer.ts` | Meta-prompt + result parser for "Brief an Idea" (see "Grooming" below). |
 | `server/orchestrator.ts` | Meta-prompt + turn-status parser for the orchestrator (see "Goal Orchestration"). |
 | `server/orchestrator-engine.ts` | Orchestrator engine: watches the bus and resumes a waiting orchestrator session when its worker tasks land. |
+| `server/sessionNotify.ts` | Session notices: when a task an interactive agent created from a terminal session lands, types one sanitized `[ployd] task …` line into that session (see "Terminal sessions"). Owns the line, its sanitizer, the per-session queue and the delivery guards. |
 | `server/sentinels.ts` | Tolerant extraction of the sentinel-delimited JSON `groomer.ts`, `orchestrator.ts` and `reviewer.ts` end a turn with. |
 | `server/types.ts` | Shared interfaces (`Task`, `Repo`, `Db`, `Decision`, …). Typing only. |
 | `server/paths.ts` | Resolves the app root (`public/`, `assets/`, `build/`) from source or `dist/`. |
@@ -853,6 +854,77 @@ relaunch) doesn't lose the tabs — see "Restored after a restart" below.
   *before* killing the shells and keeps those deaths out of the file: the server going
   away is not the user closing tabs.
 
+### Reporting back: a session hears about the tasks it created
+
+An agent running in a session can queue board tasks through the `/mcp` server (see
+"MCP server"). Ployd remembers which session asked and, when the task lands, types a
+one-line notice into that session, so the agent reads the result as a message and
+nobody copies output between windows. `Settings.notifySessions` (Settings → General →
+Terminal sessions, **on** by default, a strict boolean in `PATCH /api/settings`) turns
+all of it off; off, a claude session's typed line is exactly what it was before.
+
+- **The link** is `task.originSessionId` (plus `originSessionLabel`, the label at the
+  time, which the card's chip shows). Only `create_task` sets it, never `PATCH`, and
+  only after `terminal.isLive` says the id names a session that exists and hasn't
+  exited; anything else is ignored, never an error. Two ways in:
+  - **Automatic, for a claude session.** `terminal.startupLine` types
+    `claude --mcp-config '{"mcpServers":{"ployd":{"type":"http","url":"<base>/mcp?session=<id>"}}}'`,
+    so the agent has the board tools with no `claude mcp add` and every task it creates
+    over that URL is linked. The query only tags the caller: the request still goes
+    through the Host allowlist, the loopback bind and the remote-access gate in front
+    of `/mcp`, like any other client (invariant #1). The server is named `ployd`, like
+    the one users add by hand. No `--strict-mcp-config`: an interactive session keeps
+    the user's own servers.
+  - **By argument, for anything else** (codex, grok, a custom agent, a claude the
+    user started themselves). Every session's shell starts with `PLOYD_SESSION_ID` and `PLOYD_URL`
+    (`terminal.sessionEnv`), and `create_task` takes an optional `origin_session`
+    whose description tells the agent to pass `$PLOYD_SESSION_ID`. The URL's session
+    wins when both are given.
+- **When.** `server/sessionNotify.ts` watches the bus. A linked task reaching
+  `validation`, `failed` or `done` is a landing; `code_review` is still in flight (the
+  orchestrator engine's rule), and a 4 s debounce keeps a run that parks in validation
+  and flows into code review from reporting twice. One notice per landing: the same
+  status re-broadcast is ignored, `validation` → `done` is a landing of its own, and a
+  task dispatched again starts over. Tasks already landed at boot are never announced.
+- **What.** One server-built line:
+  `[ployd] task <id> "<title>" finished: validation, grade 4/5, PR <url> - get_task <id> for details`
+  (`error "<lastError>"` instead of a grade on a failure). **The sanitizing rule is the
+  security-critical part:** every piece of task text (title, error) goes through
+  `sanitizeText` — escape sequences (CSI, OSC/DCS/APC strings, the 8-bit C1 forms)
+  removed whole, every other control character (newlines, CR, ESC, DEL, C1, U+2028/9,
+  zero-width and bidi marks) turned into a space, length capped (title 80, error 160,
+  line 400) — and then `quotedText` drops what a POSIX shell expands inside double
+  quotes (`"` and backquote become `'`; `$`, `\`, `!` go). The PR URL is typed only if
+  it is a plain `https://host/path` with no query or shell characters. So a title can
+  never add a keystroke, end the line early, or run anything even if the line reached a
+  shell. Tests cover hostile titles; keep them passing.
+- **Who.** Only agent sessions (`claude` / `codex` / `grok` / `custom`), never a plain
+  shell — typing into bash runs a command. A custom agent's foreground check matches the
+  program its saved command starts (`sessionAgents.programOf`); one removed from
+  Settings matches nothing, so it gets no notice. An exited (or dismissed) session drops its queue.
+- **How it's delivered.** The notice is queued per session (process-local, capped at
+  10, never persisted) and written only when every guard passes, re-checked right
+  before the write: the session is `idle` (from the agent's own OSC 7501 report when it
+  sends one, otherwise the 30 s silence timer), the user has no half-typed line
+  (`draft`, tracked by `terminal.write`: printable input since the last Enter / Ctrl-C
+  / Ctrl-U), **no menu or yes/no prompt is what the program drew last**
+  (`menuOnScreen` over the output since the last keystroke, capped at 8 KB — input answers or closes a menu, so what is drawn after it is what counts: a highlighted `❯ 1.` / `› 1.` option,
+  "Do you want to…", "Press enter to…", `(y/n)`), and the agent itself is the
+  terminal's foreground program (`agentInForeground`: the shell's `tpgid` from `ps`
+  must be a process group running the agent's bin, so an agent session whose agent was
+  quit back to the shell gets nothing). The menu guard exists because an Enter typed
+  into a picker chooses the highlighted option — a live test typed into codex's
+  "Update available" picker and ran `npm install -g @openai/codex`. It is a heuristic
+  that errs towards waiting. One notice goes out per idle transition; the agent taking
+  it makes the session active, and the next idle sends the next. Windows (no pty, no
+  process groups) never delivers.
+- **The write** is the line as a **bracketed paste** (`ESC[200~ … ESC[201~`) when the
+  program switched that mode on (`terminal.ts` tracks `ESC[?2004h/l` in the output),
+  then Enter (`\r`). Verified against a live interactive `claude` 2.1.316: typed text
+  plus `\r` in one write is taken as a paste and is **not** submitted; the
+  bracketed-paste form is submitted as a user message, with the `\r` in the same write
+  or a separate one.
+
 On the board (`public/features/terminal.js`) a session has **two possible homes, one
 per layout**: a tab in the panel docked at the bottom of the window (classic), or a
 full-height tab in the work area (sidebar — see "The tabbed work area"). The
@@ -973,6 +1045,14 @@ bridge the CLI spawns to *ask the user* about a tool; this one is a long-lived
 - **No new security boundary.** There's no auth — the endpoint rides the same
   `127.0.0.1`-only bind as `/api`, which *is* the boundary (invariant #1). It exposes
   exactly the task-control power the local REST API already does. Keep it localhost.
+- **Who's asking (`?session=<id>`).** A claude terminal session Ployd starts gets this
+  server on `/mcp?session=<its id>`; `handlePost` passes the id to `callTool` as
+  context, and `create_task` links the new task to that session
+  (`task.originSessionId`) when the id names a live one. `create_task` also takes an
+  optional `origin_session` argument for clients on the plain URL (an agent in a
+  session passes `$PLOYD_SESSION_ID`). Neither is a credential, and neither changes
+  what the request may do — it only decides which session hears back when the task
+  lands. See "Reporting back" under "Terminal sessions".
 - To add a tool, append a `TOOL_DEFS` entry (name + JSON `inputSchema`) and a `case`
   in `callTool`; the pure `respond()` handler and the smoke tests cover the protocol.
 
