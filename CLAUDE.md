@@ -38,6 +38,7 @@ static with **no build step** (see Conventions).
 | `server/mcp.ts` | **Board MCP server** (see "MCP server" below). Streamable-HTTP MCP endpoint mounted on the Express app at `POST /mcp` so outside MCP clients can drive the board while Ployd runs. |
 | `server/git.ts` | Worktree lifecycle (`git worktree add/remove`). |
 | `server/terminal.ts` | In-app shell sessions: a pty per session (a python3 relay, no native module), their status, the resize channel, and the saved list that restores them after a restart (see "Terminal sessions"). |
+| `server/programStatus.ts` | OSC 7501 (Program Status Protocol) for terminal sessions: a chunk parser for the reports an agent prints, and the rules that turn them into a session's status. Pure; `terminal.ts` owns the side effects (see "Terminal sessions"). |
 | `server/desktop.ts` | Desktop hand-offs for the workspace quick actions: reveal a checkout in the OS file manager, or open it in the user's IDE (see "Workspace quick actions"). |
 | `server/scripts.ts` | Reads a checkout's `package.json` scripts and the package manager that runs them, and turns a script *name* into a command line (see "Package scripts"). Runs nothing itself. |
 | `server/resources.ts` | Opt-in resource monitor: samples the OS process table and reports what the app and each live agent session cost this machine (see "Resource monitor"). |
@@ -719,10 +720,36 @@ relaunch) doesn't lose the tabs — see "Restored after a restart" below.
   not exec'd — so quitting the agent leaves you at a live prompt instead of killing
   the tab. The picker only offers a CLI `/api/health` actually found on this machine.
 - **Status** is the green/amber/red bullet every surface shows: `active` (alive and
-  printing), `idle` (alive but quiet for 30s — sitting at a prompt, waiting for you),
-  `exited` (the process is gone; the tab stays red and its scrollback readable until
-  dismissed). One sweep timer turns "went quiet" into a `terminal` bus event; every
-  other transition is broadcast by whatever caused it.
+  working), `idle` (alive and waiting for you), `exited` (the process is gone; the tab
+  stays red and its scrollback readable until dismissed). A live session's status has
+  two sources:
+  - **The agent's own report (OSC 7501).** An agent that speaks the
+    [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+    (rev 0.4) prints `ESC ] 7501 ; state=<word>:app=<name> ST` (ST is `ESC \` or BEL).
+    `server/programStatus.ts` finds these in the pty output — a sequence cut across two
+    reads is carried over — and passes the bytes through untouched (xterm.js ignores
+    the OSC, so replay and rendering don't change). `working` → `active`; `idle`,
+    `done`, `blocked`, `error` → `idle`. Only the root record (no `id`) counts. Once a
+    session has reported, **the silence timer doesn't override it**: a thinking agent
+    stays green however quiet it is. The report ends — and the timer takes back over —
+    on the agent's own `state=clear` (Claude and Codex send it on exit), a full reset
+    (`ESC c`), a new shell prompt (`OSC 133;A`, if the shell has integration; `done` /
+    `error` survive that, per the spec), a line submitted with Enter while the state is
+    anything but `working` (the agent re-reports `working` the moment it takes the line;
+    a crashed one leaves a plain shell the timer grades), or 10 minutes of total
+    silence on a `working` report (an agent TUI redraws a spinner while it works, so
+    that long means it died without saying so).
+  - **The silence timer**, for everything that never reports: `idle` after 30s with no
+    output. One sweep timer turns "went quiet" into a `terminal` bus event; every other
+    transition (a report included) is broadcast by whatever caused it.
+
+  **Who reports today.** Claude Code (2.1.295+) asks first — `OSC 7501 ; ?` then
+  `CSI c` — and reports only if the 7501 answer arrives before the device-attributes
+  one. xterm.js doesn't answer it, so the server does: `terminal.ts` writes the spec's
+  fixed reply (`QUERY_REPLY`) into the pty, on a real pty only. That's the only thing
+  this feature ever writes into a session. Codex (0.163.0+) reports without asking
+  whenever its stdout is a terminal. Grok 0.2.114 doesn't report, so it stays on the
+  timer. None of them needs a hook, flag or env var, and Ployd sets none.
 - **Closing vs dismissing.** Leaving a session (hiding the panel, or switching to
   another tab) is a *view* change — it keeps running. `POST /api/terminal/:id/close`
   kills the shell but keeps it listed as exited; `DELETE /api/terminal/:id` (the tab's
