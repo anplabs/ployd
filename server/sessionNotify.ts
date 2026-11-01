@@ -51,13 +51,14 @@ import { subscribe } from './bus';
 import * as terminal from './terminal';
 import * as github from './github';
 import * as runner from './runner';
+import * as sessionAgents from './sessionAgents';
 import type { Task, TaskStatus } from './types';
 
 // Statuses that mean "this task landed". `code_review` is deliberately absent:
 // a task being graded lands in `validation` next.
 const TERMINAL: TaskStatus[] = ['validation', 'failed', 'done'];
 // Session kinds whose program is an agent that reads the line as a message.
-const AGENT_KINDS = new Set<string>(['claude', 'codex', 'grok']);
+const AGENT_KINDS = new Set<string>(['claude', 'codex', 'grok', 'custom']);
 
 // Caps for task-derived text, and for the whole line as a last word.
 const MAX_TITLE = 80;
@@ -194,8 +195,15 @@ function parsePs(stdout: string): PsRow[] {
 }
 
 // The program names an agent session's foreground process may show up as: the
-// basename of the bin the session typed (a custom CLI path included).
-function agentNames(kind: string): string[] {
+// basename of the bin the session typed (a custom CLI path included). A custom
+// agent is matched on the program its saved command starts (`aider` for
+// `aider --model x`); one that is gone from Settings matches nothing.
+function agentNames(kind: string, agentId?: string): string[] {
+  if (kind === 'custom') {
+    const agent = sessionAgents.find(db.settings.sessionAgents, agentId);
+    const prog = agent ? sessionAgents.programOf(agent.command) : null;
+    return prog ? [path.basename(prog).replace(/\.(exe|cmd|bat)$/i, '')] : [];
+  }
   const bin = kind === 'claude' ? runner.CLAUDE_BIN : kind === 'codex' ? runner.CODEX_BIN : kind === 'grok' ? runner.GROK_BIN : '';
   if (!bin) return [];
   const base = path.basename(bin).replace(/\.(exe|cmd|bat)$/i, '');
@@ -207,8 +215,8 @@ function agentNames(kind: string): string[] {
 // pty relay; the shell is its child, and the shell's controlling terminal's
 // foreground group (tpgid) is whatever owns the keyboard. An agent launched
 // through an interpreter (`node …/codex`) is matched on its script's name.
-function agentInForeground(rows: PsRow[], relayPid: number, kind: string): boolean {
-  const names = agentNames(kind);
+function agentInForeground(rows: PsRow[], relayPid: number, kind: string, agentId?: string): boolean {
+  const names = agentNames(kind, agentId);
   if (!names.length) return false;
   const shell = rows.find((r) => r.ppid === relayPid);
   if (!shell || shell.tpgid <= 0 || shell.tpgid === shell.pgid) return false;
@@ -243,7 +251,7 @@ const defaultDeps: Deps = {
   write: (sid, data) => terminal.write(sid, data),
   foreground: async (t) => {
     if (process.platform === 'win32' || !t.pid) return false;
-    return agentInForeground(await readPs(), t.pid, t.kind);
+    return agentInForeground(await readPs(), t.pid, t.kind, t.agentId);
   },
   prUrl: async (task) => {
     if (!task.branch) return null;

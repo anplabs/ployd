@@ -12,7 +12,7 @@ import { db, save, id, now, readLog, removeLog, getTask, getRepo, getGrooming, g
 import { broadcast, sse } from './bus';
 import { appRoot } from './paths';
 import type { GroomSpec } from './groomer';
-import type { AskSession, Task, Attachment, CustomModel, Grooming, GroomingTarget, Orchestration, Repo, PublicSettings, WorktreeInfo, TaskAgent } from './types';
+import type { AskSession, Task, Attachment, CustomModel, SessionAgent, Grooming, GroomingTarget, Orchestration, Repo, PublicSettings, WorktreeInfo, TaskAgent } from './types';
 import { suggestModel } from './models';
 import * as git from './git';
 import * as runner from './runner';
@@ -35,6 +35,7 @@ import * as conflicts from './conflicts';
 import * as prRefresh from './pr-refresh';
 import * as framing from './framing';
 import * as terminal from './terminal';
+import * as sessionAgents from './sessionAgents';
 import * as desktop from './desktop';
 import * as scripts from './scripts';
 import * as usage from './usage';
@@ -297,6 +298,8 @@ function publicSettings(): PublicSettings {
     sounds: db.settings.sounds,
     linearConfigured: !!(db.settings.linearApiToken && db.settings.linearApiToken.trim()),
     maxParallelSessions: db.settings.maxParallelSessions,
+    detachedRuns: !!db.settings.detachedRuns,
+    detachedRunsSupported: process.platform !== 'win32',
     installedPlugins: plugins.sanitize(db.settings.installedPlugins),
     mergeStrategy: db.settings.mergeStrategy,
     autoResolveConflicts: !!db.settings.autoResolveConflicts,
@@ -317,6 +320,8 @@ function publicSettings(): PublicSettings {
     // Derived, so the board can show what "Auto" means on this machine today.
     sessionMemoryAutoMb: runner.autoSessionMemoryMb(),
     notifySessions: db.settings.notifySessions !== false,
+    sessionAgents: db.settings.sessionAgents || [],
+    sessionAgentsFound: sessionAgents.availability(db.settings.sessionAgents),
   };
 }
 
@@ -632,6 +637,13 @@ app.patch('/api/settings', (req: Request, res: Response) => {
     }
     db.settings.maxParallelSessions = n;
   }
+  // Detached runs (docs/specs/detached-runner.md): read when a run starts, so
+  // flipping it never touches a live run. A strict boolean — a stray value must
+  // not quietly change how runs survive a quit.
+  if ('detachedRuns' in req.body) {
+    if (typeof req.body.detachedRuns !== 'boolean') return err(res, 400, 'detachedRuns must be true or false');
+    db.settings.detachedRuns = req.body.detachedRuns;
+  }
   // Marketplace: the board sends the full desired set of installed plugin ids;
   // unknown ids are dropped so only real plugins can be toggled on.
   if ('installedPlugins' in req.body) db.settings.installedPlugins = plugins.sanitize(req.body.installedPlugins);
@@ -695,6 +707,9 @@ app.patch('/api/settings', (req: Request, res: Response) => {
   // Custom models (e.g. Amazon Bedrock): the board sends the full desired list;
   // we sanitize it into clean entries (invalid rows dropped, API key stripped).
   if ('customModels' in req.body) db.settings.customModels = sanitizeCustomModels(req.body.customModels);
+  // Custom session agents: the board sends the full desired list; malformed rows
+  // are dropped, like custom models (server/sessionAgents.ts).
+  if ('sessionAgents' in req.body) db.settings.sessionAgents = sessionAgents.sanitize(req.body.sessionAgents);
 
   // Remote access: rotate the token on request (revokes all remote sessions),
   // then apply the on/off toggle — generating a token lazily when first enabling
@@ -1001,12 +1016,17 @@ async function restoreTerminalSessions(): Promise<terminal.Summary[]> {
 // Once per process: start() can be called again on a busy port (Electron walks
 // a port ladder), and a second pass would spawn every shell twice.
 let terminalsRestored = false;
+let runsReattached = false;
 
 // Opens an in-app shell session rooted at the repo root or one of its live
 // worktrees, so the user can drop into a terminal on the checkout they're
 // viewing without leaving Ployd. `kind` boots the shell straight into an
-// agent CLI ('claude' | 'codex' | 'grok'). Returns the new session's summary;
-// the board then streams it via GET /api/terminal/:id/stream.
+// agent CLI ('claude' | 'codex' | 'grok'), or `kind: 'custom'` + `agentId` into
+// one of the user's own agents from Settings. The body names an agent by *id*
+// only: its command is looked up in Settings here, an unknown id is refused, and
+// a `command` in the body is ignored — so this route can't be handed a command
+// line to run (same rule as the Run button's scripts route). Returns the new
+// session's summary; the board then streams it via GET /api/terminal/:id/stream.
 app.post('/api/repos/:id/terminal', async (req: Request, res: Response) => {
   const repo = db.repos.find((r) => r.id === req.params.id);
   if (!repo) return err(res, 404, 'Repo not found');
@@ -1014,10 +1034,15 @@ app.post('/api/repos/:id/terminal', async (req: Request, res: Response) => {
   if (!target) return err(res, 404, 'Path not found');
   const kind = req.body?.kind;
   if (kind !== undefined && !terminal.isKind(kind)) return err(res, 400, 'Unknown session kind');
+  let agent: SessionAgent | undefined;
+  if (kind === 'custom' || req.body?.agentId !== undefined) {
+    agent = sessionAgents.find(db.settings.sessionAgents, req.body?.agentId);
+    if (!agent) return err(res, 404, 'No such session agent in Settings');
+  }
   const cols = Number(req.body?.cols) || 80;
   const rows = Number(req.body?.rows) || 24;
   try {
-    res.json(terminal.create({ cwd: target, repoId: repo.id, kind, cols, rows }));
+    res.json(terminal.create({ cwd: target, repoId: repo.id, kind: agent ? 'custom' : kind, agent, cols, rows }));
   } catch (e) {
     err(res, 500, (e as Error).message);
   }
@@ -2184,6 +2209,20 @@ function rebind(): void {
  * @param port - desired port; pass 0 for an OS-assigned free port.
  */
 async function start(port: string | number = process.env.PORT || 7777): Promise<{ server: Server; port: number; url: string }> {
+  // Pick up the detached task runs a previous server left behind (see
+  // runner.reattachAll) before listening, so a permission bridge retrying
+  // through the restart finds its task live, and the first board sees the truth.
+  if (!runsReattached) {
+    runsReattached = true;
+    try {
+      const { reattached, finished } = runner.reattachAll();
+      if (reattached.length || finished.length) {
+        console.log(`[runner] detached runs: ${reattached.length} reattached, ${finished.length} finished while down`);
+      }
+    } catch (e) {
+      console.error('[runner] reattach failed:', (e as Error).message);
+    }
+  }
   // Restore the shell sessions before listening, so the first board to connect
   // already sees them; otherwise its saved tabs would be pruned as dead.
   if (!terminalsRestored) {
@@ -2241,7 +2280,9 @@ if (require.main === module) {
   });
 
   process.on('SIGINT', () => {
-    runner.stopAll();
+    // Stops every attached run; with Settings.detachedRuns on, leaves the
+    // detached ones running for the next boot to reattach.
+    runner.shutdown();
     // Saves the open shell sessions before killing them, so the next boot
     // restores them (see server/terminal.ts).
     terminal.closeAll();

@@ -462,6 +462,26 @@ test('sessionNotify: the foreground check finds the agent, not the shell at its 
   assert.strictEqual(n.agentInForeground(rows(200, `${claude}`), 100, 'shell'), false, 'a shell kind never matches');
 });
 
+test('sessionNotify: a custom agent session is matched on its saved command', () => {
+  const n = require('../server/sessionNotify');
+  const store = require('../server/store');
+  const saved = store.db.settings.sessionAgents;
+  store.db.settings.sessionAgents = [{ id: 'aider', label: 'Aider', command: 'OPENAI_BASE=x aider --model sonnet' }];
+  const rows = (fg: string) => n.parsePs([
+    '  100     1   100     0 python3 -c ...',
+    '  101   100   101   200 -zsh',
+    `  200   101   200   200 ${fg}`,
+  ].join('\n'));
+  try {
+    assert.strictEqual(n.agentInForeground(rows('/usr/local/bin/aider --model sonnet'), 100, 'custom', 'aider'), true, 'its program in front');
+    assert.strictEqual(n.agentInForeground(rows('python3 /opt/aider/bin/aider'), 100, 'custom', 'aider'), true, 'through an interpreter');
+    assert.strictEqual(n.agentInForeground(rows('vim notes.md'), 100, 'custom', 'aider'), false, 'some other program in front');
+    assert.strictEqual(n.agentInForeground(rows('aider'), 100, 'custom', 'gone'), false, 'an agent removed from Settings matches nothing');
+  } finally {
+    store.db.settings.sessionAgents = saved;
+  }
+});
+
 test('index: PATCH /api/settings validates notifySessions and exposes it', async () => {
   const store = require('../server/store');
   const index = require('../server/index');

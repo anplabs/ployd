@@ -15,7 +15,7 @@ import { appendEvent } from './pr.js';
 import { renderRemoteAccess } from './remote.js';
 import { renderRepoList } from './repos-modal.js';
 import { resourceMonitorOn, syncResourceMonitor } from './resources.js';
-import { renderEditorSetting, renderSessionMemorySetting } from './settings-modal.js';
+import { renderEditorSetting, renderSessionAgentsSetting, renderSessionMemorySetting } from './settings-modal.js';
 import { maybeNotifyBrowser, maybeNotifyGroomingBrowser, maybeNotifyOrchestrationBrowser, maybePlayGroomingSound, maybePlayOrchestrationSound, maybePlayTaskSound, notificationsOn, renderPluginState, updateNotifNote } from './settings.js';
 import { soundsOn } from './sounds.js';
 import { pruneTabs } from './tabs.js';
@@ -76,6 +76,7 @@ function connectSSE() {
         renderSessionMemorySetting();
         updateNotifNote();
         renderEditorSetting();
+        renderSessionAgentsSetting();
         renderPlugins();
         renderCustomModels();
         renderRemoteAccess();

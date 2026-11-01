@@ -932,6 +932,18 @@
                 so several parallel sessions each plan to use all of it — which is how a busy board ends up swapping
                 and freezing. This hands each session a budget instead. <strong>Auto</strong> divides a share of this
                 machine's RAM by the cap above.</p>
+              <label class="check addon">
+                <input type="checkbox" id="setting-detached-runs" />
+                <span class="addon-text">
+                  <span class="addon-label">Keep task runs going when Ployd quits or restarts</span>
+                  <span class="addon-hint">Task runs and code reviews run as their own background processes and write
+                    their output to files, so quitting the app, a crash or relaunching for an update no longer kills
+                    them — Ployd picks them back up when it starts again, and finishes any that ended while it was
+                    away. Applies to runs started after you turn it on. Grooming, orchestration and Ask still stop with
+                    the app. <span id="setting-detached-runs-windows">Not available on Windows: runs there always stop
+                    with the app.</span></span>
+                </span>
+              </label>
             </fieldset>
             <fieldset class="addons">
               <legend>Agent isolation</legend>
@@ -999,6 +1011,19 @@
                 JetBrains IDEs — and falls back to the installed app on macOS. Editors it can't find on this machine are
                 listed as unavailable.</p>
               <button class="btn ghost" id="setting-editor-rescan"><span class="i" data-icon="rotate-cw"></span>Rescan for editors</button>
+            </fieldset>
+            <fieldset class="addons">
+              <legend>Session agents</legend>
+              <p class="addon-hint">Your own agent commands for terminal sessions, offered in the new-session picker
+                after Claude, Codex and Grok — <code>aider</code>, <code>opencode</code>, <code>gemini</code>,
+                <code>claude --model opus</code>. The command is typed at a fresh shell's prompt on the checkout, as if
+                you had typed it yourself, so quitting the agent leaves you at a live prompt. One line, no secrets.</p>
+              <div id="session-agents-body" class="session-agents-body"></div>
+              <div class="session-agent-row session-agent-add">
+                <input id="session-agent-add-label" type="text" maxlength="40" placeholder="Name, e.g. Aider" aria-label="New agent name" />
+                <input id="session-agent-add-command" class="mono" type="text" maxlength="500" placeholder="Command, e.g. aider --model sonnet" aria-label="New agent command" />
+                <button class="btn" id="session-agent-add-btn"><span class="i" data-icon="plus"></span>Add</button>
+              </div>
             </fieldset>
             <fieldset class="addons">
               <legend>Pull requests</legend>

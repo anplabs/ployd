@@ -3,9 +3,12 @@ import path from 'path';
 import { spawn } from 'child_process';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { Writable } from 'stream';
+import { StatusParser, applyEvent, onInput, reportedStatus, QUERY_REPLY } from './programStatus';
+import type { Reported } from './programStatus';
 import * as bus from './bus';
 import { id, db, DATA_DIR } from './store';
 import * as runner from './runner';
+import type { SessionAgent } from './types';
 
 // In-app shell sessions. Each session is a real interactive shell running on a
 // pseudo-terminal so prompts, colors, and full-screen apps (vim, top) work. We
@@ -14,7 +17,9 @@ import * as runner from './runner';
 // the only dep). python3 ships on macOS dev machines (Command Line Tools) and
 // virtually all Linux; Windows has no pty here and falls back to a plain pipe.
 //
-// A session can boot straight into an agent CLI (`kind`) or into a command
+// A session can boot straight into an agent CLI (`kind`), into one of the
+// user's own agents from Settings (`kind: 'custom'` + `agent`, looked up by id
+// in the route — never a command from the request), or into a command
 // (`command`, e.g. the `npm run dev` behind the workspace's Run button): the
 // shell starts as usual and the line is typed into it, so quitting `claude` —
 // or Ctrl-C'ing the dev server — leaves you at a live prompt instead of killing
@@ -36,10 +41,11 @@ import * as runner from './runner';
 // a one-line notice into the session; this module only reports what it needs
 // to decide when (notifyTarget) and does the write.
 
-type Kind = 'shell' | 'claude' | 'codex' | 'grok';
+type Kind = 'shell' | 'claude' | 'codex' | 'grok' | 'custom';
 // active = alive and printing; idle = alive but quiet (sitting at a prompt,
-// waiting for you); exited = the process is gone. The board renders them as a
-// green / amber / red bullet.
+// waiting for you), unless the agent inside reports its own state through
+// OSC 7501 (see statusOf); exited = the process is gone. The board renders them
+// as a green / amber / red bullet.
 type Status = 'active' | 'idle' | 'exited';
 
 interface Session {
@@ -54,6 +60,8 @@ interface Session {
   // The line typed at the fresh prompt for a command session (a package
   // script), else undefined. Kept so the board can label and re-run it.
   command?: string;
+  // The Settings id of a custom agent session, so the board can duplicate it.
+  agentId?: string;
   child: ChildProcessWithoutNullStreams;
   // The relay's resize channel (fd 3); null on Windows, which has no pty here.
   control: Writable | null;
@@ -81,6 +89,12 @@ interface Session {
   // yes/no prompt is showing, where their Enter would pick an option instead of
   // sending a message.
   tail: Buffer;
+  // What the program inside last said it was doing through OSC 7501 (see
+  // server/programStatus.ts), or null when nothing has reported — or the
+  // report has since ended. While set, it decides the status, not the timer.
+  reported: Reported | null;
+  // Finds those reports in the output, carrying a sequence cut across reads.
+  statusParser: StatusParser;
 }
 
 interface Summary {
@@ -90,6 +104,7 @@ interface Summary {
   kind: Kind;
   label: string;
   command?: string;
+  agentId?: string;
   status: Status;
   createdAt: string;
 }
@@ -115,11 +130,11 @@ const SAVED_PATH = path.join(DATA_DIR, 'terminal-sessions.json');
 const SAVE_DEBOUNCE_MS = 250;
 
 const KIND_LABEL: Record<Kind, string> = {
-  shell: 'Shell', claude: 'Claude', codex: 'Codex', grok: 'Grok',
+  shell: 'Shell', claude: 'Claude', codex: 'Codex', grok: 'Grok', custom: 'Agent',
 };
 
 function isKind(v: unknown): v is Kind {
-  return v === 'shell' || v === 'claude' || v === 'codex' || v === 'grok';
+  return v === 'shell' || v === 'claude' || v === 'codex' || v === 'grok' || v === 'custom';
 }
 
 // The MCP server name a Ployd-started claude session gets for the board (see
@@ -189,15 +204,33 @@ function shQuote(s: string): string {
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+// Two sources: an agent that speaks OSC 7501 says itself whether it is working
+// (and a silent, thinking agent stays active); anything else is graded by the
+// silence timer.
 function statusOf(s: Session): Status {
   if (s.exited) return 'exited';
-  return Date.now() - s.lastActivity > IDLE_MS ? 'idle' : 'active';
+  const quiet = Date.now() - s.lastActivity;
+  if (s.reported) return reportedStatus(s.reported, quiet);
+  return quiet > IDLE_MS ? 'idle' : 'active';
+}
+
+// Reads OSC 7501 out of a chunk of pty output. The only thing ever written back
+// is the protocol's fixed feature-detection reply, and only on a real pty (the
+// Windows pipe fallback has no terminal to speak for).
+function trackStatus(s: Session, chunk: Buffer): void {
+  for (const e of s.statusParser.feed(chunk)) {
+    if (e.type === 'query') {
+      if (s.control && !s.exited) s.child.stdin.write(QUERY_REPLY);
+    } else {
+      applyEvent(s, e);
+    }
+  }
 }
 
 function summary(s: Session): Summary {
   return {
     id: s.id, repoId: s.repoId, cwd: s.cwd, kind: s.kind,
-    label: s.label, command: s.command, status: statusOf(s), createdAt: s.createdAt,
+    label: s.label, command: s.command, agentId: s.agentId, status: statusOf(s), createdAt: s.createdAt,
   };
 }
 
@@ -333,6 +366,7 @@ function trimExited(): void {
 // reuses the saved id, label and creation time, and prints `notice` at the top
 // of the pane.
 function create(opts: {
+  agent?: SessionAgent;
   cwd: string; repoId: string; kind?: Kind; command?: string; cols?: number; rows?: number;
   restored?: { id: string; label: string; base: string; createdAt: string; notice: string };
 }): Summary {
@@ -367,6 +401,8 @@ function create(opts: {
     bufferBytes: 0,
     listeners: new Set(),
     exited: false,
+    reported: null,
+    statusParser: new StatusParser(),
     createdAt: restored ? restored.createdAt : new Date().toISOString(),
     lastActivity: Date.now(),
     status: 'active',
@@ -374,6 +410,15 @@ function create(opts: {
     draft: false,
     tail: Buffer.alloc(0),
   };
+  // A custom agent session is named after its Settings label and numbered the
+  // same way ("Aider", "Aider 2"), and types that agent's saved command.
+  const { agent } = opts;
+  if (agent) {
+    session.kind = 'custom';
+    session.agentId = agent.id;
+    session.base = agent.label;
+    session.label = labelFor(repoId, agent.label);
+  }
   sessions.set(sid, session);
 
   const emit = (chunk: Buffer) => {
@@ -389,7 +434,8 @@ function create(opts: {
     const off = chunk.lastIndexOf(PASTE_OFF);
     if (on !== off) session.pasteMode = on > off;
     session.tail = Buffer.concat([session.tail, chunk]).subarray(-TAIL_BYTES);
-    if (session.status !== 'active') announce(session);
+    trackStatus(session, chunk);
+    if (statusOf(session) !== session.status) announce(session);
     for (const fn of session.listeners) fn(b64);
   };
   // A restored session's notice goes first in the buffer, so it is the top line
@@ -411,7 +457,7 @@ function create(opts: {
   // Type the agent CLI (or the package script) at the fresh prompt rather than
   // exec'ing it, so the tab survives quitting the agent / stopping the script.
   // The pty buffers this until the shell reads it.
-  const startup = startupLine(kind, sid, command);
+  const startup = startupLine(kind, sid, command || agent?.command);
   if (startup) child.stdin.write(`${startup}\n`);
 
   syncSweep();
@@ -454,7 +500,8 @@ function write(sid: string, data: string): boolean {
   // what the program draws next is what a notice will look at. Otherwise a
   // closed menu's text lingers in it until enough new output pushes it out.
   s.tail = Buffer.alloc(0);
-  if (s.status !== 'active') announce(s);
+  onInput(s, data);
+  if (statusOf(s) !== s.status) announce(s);
   return true;
 }
 
@@ -470,6 +517,8 @@ function isLive(sid: string): boolean {
 interface NotifyTarget {
   id: string;
   kind: Kind;
+  // Which Settings agent a `custom` session runs (see Session.agentId).
+  agentId?: string;
   label: string;
   status: Status;
   pid: number | null;
@@ -482,7 +531,7 @@ function notifyTarget(sid: string): NotifyTarget | null {
   const s = sessions.get(sid);
   if (!s) return null;
   return {
-    id: s.id, kind: s.kind, label: s.label, status: statusOf(s),
+    id: s.id, kind: s.kind, agentId: s.agentId, label: s.label, status: statusOf(s),
     pid: s.child.pid ?? null, pasteMode: s.pasteMode, draft: s.draft, tail: s.tail.toString('utf8'),
   };
 }
@@ -616,7 +665,9 @@ function readSaved(): SavedSession[] {
 
 function noticeFor(s: SavedSession): string {
   if (s.command) return `Restored after restart. "${s.command}" was not restarted.`;
-  if (s.kind !== 'shell') return `Restored after restart. The previous ${KIND_LABEL[s.kind]} session ended.`;
+  // A custom agent is named by its own label ("Aider"), not the generic "Agent".
+  const what = s.kind === 'custom' ? s.base : KIND_LABEL[s.kind];
+  if (s.kind !== 'shell') return `Restored after restart. The previous ${what} session ended.`;
   return 'Restored after restart.';
 }
 

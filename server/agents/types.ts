@@ -65,6 +65,10 @@ export interface PromptDelivery {
   // Called exactly once by the runner after the child exits (or fails to spawn),
   // e.g. to delete a temp prompt file. Must not throw.
   cleanup?: () => void;
+  // The files `cleanup` removes, by path. A detached run (server/detached.ts)
+  // can outlive the closure above across a server restart, so it records these
+  // and deletes them itself once the run is known to have ended.
+  tempFiles?: string[];
 }
 
 export interface AgentAdapter {

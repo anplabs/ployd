@@ -39,6 +39,12 @@ function renderSessionMemorySetting() {
   const value = state.settings.sessionMemoryMb;
   $('#setting-session-memory').value = value === undefined || value === 'auto' ? 'auto' : String(value);
   $('#setting-isolate-mcp').checked = state.settings.isolateMcpServers !== false;
+  // Detached runs: a POSIX feature, so on Windows the box is shown disabled
+  // with the line that says why (the server ignores the setting there anyway).
+  const supported = state.settings.detachedRunsSupported !== false;
+  $('#setting-detached-runs').checked = supported && !!state.settings.detachedRuns;
+  $('#setting-detached-runs').disabled = !supported;
+  $('#setting-detached-runs-windows').hidden = supported;
 }
 
 // `section` may be a string ('general' | 'plugins') or a DOM event (from the
@@ -60,6 +66,7 @@ function openSettingsModal(section) {
   $('#setting-palette').value = currentPalette();
   $('#setting-layout').value = currentLayout();
   renderEditorSetting();
+  renderSessionAgentsSetting();
   renderPlugins();
   renderCustomModels();
   renderRemoteAccess();
@@ -101,8 +108,92 @@ function renderEditorSetting() {
   }
 }
 
+// ---------- custom session agents (Settings → General → Session agents) ----------
+// The user's own agent commands for terminal sessions. Each row edits in place
+// and saves the whole list on change; the server sanitizes it (drops a row with
+// no name or command, mints ids) and the new-session picker reads it straight
+// from state.settings. The mark beside a row says whether its program was found
+// on PATH — a hint only, since the login shell may still resolve an alias.
+const sessionAgents = () => state.settings.sessionAgents || [];
+
+function sessionAgentRowHtml(a, found) {
+  const tip = found
+    ? 'Found on this machine’s PATH'
+    : 'Not found on this machine’s PATH. It is still offered: your login shell may know it as an alias or function.';
+  return `
+      <div class="session-agent-row" data-id="${esc(a.id)}">
+        <input type="text" maxlength="40" value="${esc(a.label)}" data-field="label" aria-label="Name of ${esc(a.label)}" />
+        <input class="mono" type="text" maxlength="500" value="${esc(a.command)}" data-field="command" aria-label="Command for ${esc(a.label)}" />
+        <span class="session-agent-found${found ? '' : ' missing'}" title="${esc(tip)}" aria-label="${esc(tip)}">${icon(found ? 'check' : 'triangle-alert')}</span>
+        <button class="btn icon danger session-agent-remove" title="Remove" aria-label="Remove ${esc(a.label)}">${icon('trash')}</button>
+      </div>`;
+}
+
+// Re-rendered on every settings broadcast while the modal is open, so a field
+// being typed into keeps its focus, caret and unsaved text across the redraw.
+function renderSessionAgentsSetting() {
+  const body = $('#session-agents-body');
+  if (!body) return;
+  const active = document.activeElement;
+  const keep = active && body.contains(active) && active.dataset.field
+    ? { id: active.closest('.session-agent-row')?.dataset.id, field: active.dataset.field,
+      value: active.value, start: active.selectionStart, end: active.selectionEnd }
+    : null;
+  const found = state.settings.sessionAgentsFound || {};
+  body.innerHTML = sessionAgents().map((a) => sessionAgentRowHtml(a, !!found[a.id])).join('');
+  if (!keep) return;
+  const row = [...body.querySelectorAll('.session-agent-row')].find((r) => r.dataset.id === keep.id);
+  const el = row?.querySelector(`[data-field="${keep.field}"]`);
+  if (!el) return;
+  el.value = keep.value;
+  el.focus();
+  try { el.setSelectionRange(keep.start, keep.end); } catch (_) { /* not a text field */ }
+}
+
+async function setSessionAgents(list) {
+  await saveSettings({ sessionAgents: list });
+  renderSessionAgentsSetting();
+}
+
+async function addSessionAgent() {
+  const label = $('#session-agent-add-label').value.trim();
+  const command = $('#session-agent-add-command').value.trim();
+  if (!label || !command) { toast('An agent needs a name and a command.'); return; }
+  await setSessionAgents([...sessionAgents(), { label, command }]);
+  $('#session-agent-add-label').value = '';
+  $('#session-agent-add-command').value = '';
+  $('#session-agent-add-label').focus();
+}
+
 // Load-time wiring. Called from app.js in the original source order.
 export function init() {
+
+  $('#session-agent-add-btn').addEventListener('click', addSessionAgent);
+  for (const sel of ['#session-agent-add-label', '#session-agent-add-command']) {
+    $(sel).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); addSessionAgent(); }
+    });
+  }
+  $('#session-agents-body').addEventListener('change', async (e) => {
+    const field = e.target.dataset?.field;
+    const row = e.target.closest('.session-agent-row');
+    if (!field || !row) return;
+    const value = e.target.value.trim();
+    const current = sessionAgents().find((a) => a.id === row.dataset.id);
+    if (!current) return;
+    if (!value) {
+      toast('An agent needs a name and a command.');
+      e.target.value = current[field];
+      return;
+    }
+    await setSessionAgents(sessionAgents().map((a) => (a.id === current.id ? { ...a, [field]: value } : a)));
+  });
+  $('#session-agents-body').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.session-agent-remove');
+    if (!btn) return;
+    const id = btn.closest('.session-agent-row').dataset.id;
+    await setSessionAgents(sessionAgents().filter((a) => a.id !== id));
+  });
 
   $('#setting-default-editor').addEventListener('change', async (e) => {
     await saveSettings({ defaultEditor: e.target.value });
@@ -117,4 +208,4 @@ export function init() {
 }
 
 
-export { openSettingsModal, renderEditorSetting, renderSessionMemorySetting, saveSettings, showSettingsSection };
+export { openSettingsModal, renderEditorSetting, renderSessionAgentsSetting, renderSessionMemorySetting, saveSettings, showSettingsSection };
