@@ -163,6 +163,34 @@ test('index: PATCH /api/settings sanitizes custom models — drops invalid rows 
   }
 });
 
+test('index: PATCH /api/settings takes detachedRuns as a strict boolean (default off)', async () => {
+  const store = require('../server/store');
+  const index = require('../server/index');
+  const prev = store.db.settings.detachedRuns;
+  const { server, port } = await index.start(0);
+  const patch = (body: unknown) => fetch(`http://127.0.0.1:${port}/api/settings`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  try {
+    const initial = await (await fetch(`http://127.0.0.1:${port}/api/settings`)).json();
+    assert.strictEqual(initial.detachedRuns, false, 'off by default');
+    assert.strictEqual(initial.detachedRunsSupported, process.platform !== 'win32', 'the board learns whether it can work here');
+
+    const on = await patch({ detachedRuns: true });
+    assert.strictEqual(on.status, 200);
+    assert.strictEqual((await on.json()).detachedRuns, true);
+
+    const bad = await patch({ detachedRuns: 'yes' });
+    assert.strictEqual(bad.status, 400, 'a non-boolean is rejected, not coerced');
+    assert.strictEqual(store.db.settings.detachedRuns, true, 'and leaves the setting as it was');
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    store.db.settings.detachedRuns = prev;
+  }
+});
+
 test('runner: a task on a custom model layers its env onto the child but never restores ANTHROPIC_API_KEY', () => {
   const store = require('../server/store');
   const runner = require('../server/runner');
@@ -3725,6 +3753,287 @@ test('terminal: a command session types its command at the prompt and keeps a pl
     assert.strictEqual(shell.command, undefined, 'and carry no command');
   } finally {
     terminal.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Collects a session's replayed output (the buffer attach() hands a new client).
+function replayOf(terminal: { attach: (id: string, fn: (b64: string) => void) => (() => void) | null }, sid: string): string {
+  let out = '';
+  const off = terminal.attach(sid, (b64) => { out += Buffer.from(b64, 'base64').toString('utf8'); });
+  if (off) off();
+  return out;
+}
+
+test('terminal: live sessions survive a restart as plain shells with the same id and label', async () => {
+  const store = require('../server/store');
+  const terminal = require('../server/terminal');
+  const index = require('../server/index');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  const repo = { id: 'restore-r1', name: 'restore', path: dir };
+  store.db.repos.push(repo);
+  try {
+    // Start from nothing open and nothing saved.
+    terminal.closeAll();
+    terminal.flushSaved();
+    const shell = terminal.create({ cwd: dir, repoId: repo.id });
+    const agent = terminal.create({ cwd: dir, repoId: repo.id, kind: 'claude' });
+    const script = terminal.create({ cwd: dir, repoId: repo.id, command: 'npm run dev' });
+    const custom = terminal.create({
+      cwd: dir, repoId: repo.id, kind: 'custom', agent: { id: 'aider', label: 'Aider', command: 'true' },
+    });
+    const gone = terminal.create({ cwd: dir, repoId: repo.id });
+    terminal.close(gone.id); // exited: its tab is red, and it must not come back
+    terminal.flushSaved();
+
+    const ids = (rows: Array<{ id: string }>) => rows.map((r) => r.id).sort();
+    const mine = [shell.id, agent.id, script.id, custom.id].sort();
+    assert.deepStrictEqual(ids(terminal.readSaved()), mine, 'only live sessions are saved; the exited one is not');
+
+    // Shutdown kills every shell, but those deaths are the server going away:
+    // the saved list must still hold what was open.
+    terminal.closeAll();
+    assert.deepStrictEqual(terminal.list().filter((s: { repoId: string }) => s.repoId === repo.id), [], 'all gone in memory');
+    assert.deepStrictEqual(ids(terminal.readSaved()), mine, 'closeAll keeps the saved list intact');
+
+    const restored = await index._restoreTerminalSessions();
+    assert.deepStrictEqual(ids(restored), mine, 'every saved session comes back under its old id');
+    const byId = new Map(terminal.list().map((s: { id: string }) => [s.id, s]));
+    for (const sid of mine) {
+      const s = byId.get(sid) as { kind: string; command?: string; cwd: string; status: string };
+      assert.ok(s, 'listed again');
+      assert.strictEqual(s.kind, 'shell', 'a restored session is a plain shell, whatever it was before');
+      assert.strictEqual(s.command, undefined, 'and nothing is re-run in it');
+      assert.strictEqual(s.cwd, dir, 'at the same checkout');
+    }
+    assert.strictEqual((byId.get(agent.id) as { label: string }).label, 'Claude', 'the label is kept');
+    assert.strictEqual((byId.get(script.id) as { label: string }).label, 'npm run dev', 'a script label is kept too');
+
+    const agentOut = replayOf(terminal, agent.id);
+    assert.ok(agentOut.startsWith('\x1b[2mRestored after restart. The previous Claude session ended.'),
+      'the pane opens with a dim notice saying the agent did not come back');
+    assert.match(replayOf(terminal, script.id), /"npm run dev" was not restarted/);
+    assert.ok(replayOf(terminal, shell.id).startsWith('\x1b[2mRestored after restart.\x1b[0m'), 'a plain shell gets the short notice');
+    // A custom agent comes back the same way, named by its own label.
+    const restoredCustom = byId.get(custom.id) as { label: string; agentId?: string };
+    assert.strictEqual(restoredCustom.label, 'Aider');
+    assert.strictEqual(restoredCustom.agentId, undefined, 'a restored custom agent is a plain shell too');
+    assert.ok(replayOf(terminal, custom.id).startsWith('\x1b[2mRestored after restart. The previous Aider session ended.'),
+      'the notice names the custom agent, not a generic kind');
+
+    // Numbering still knows about the restored "Claude": the next one is "Claude 2".
+    const next = terminal.create({ cwd: dir, repoId: repo.id, kind: 'claude' });
+    assert.strictEqual(next.label, 'Claude 2', 'a new session is numbered after the restored ones');
+  } finally {
+    terminal.closeAll();
+    store.db.repos = store.db.repos.filter((r: { id: string }) => r.id !== repo.id);
+    terminal.flushSaved();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('terminal: restore skips a saved session whose checkout no longer resolves', async () => {
+  const store = require('../server/store');
+  const terminal = require('../server/terminal');
+  const index = require('../server/index');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  const deleted = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  fs.rmSync(deleted, { recursive: true, force: true });
+  const repo = { id: 'restore-r2', name: 'restore', path: dir };
+  const gonePathRepo = { id: 'restore-r3', name: 'gone', path: deleted };
+  store.db.repos.push(repo, gonePathRepo);
+  const row = (sid: string, repoId: string, cwd: string) => ({
+    id: sid, repoId, cwd, kind: 'shell', label: 'Shell', base: 'Shell', createdAt: new Date().toISOString(),
+  });
+  try {
+    terminal.closeAll();
+    fs.writeFileSync(terminal.SAVED_PATH, JSON.stringify({
+      version: 1,
+      sessions: [
+        row('aaaaaaaaaa', repo.id, dir), // fine: the repo root
+        row('bbbbbbbbbb', 'no-such-repo', dir), // repo unregistered
+        row('cccccccccc', repo.id, elsewhere), // not a checkout of this repo (no such worktree)
+        row('dddddddddd', gonePathRepo.id, deleted), // the directory itself is gone
+        { id: 'eeeeeeeeee', repoId: repo.id, cwd: dir, kind: 'bash', label: 'x' }, // malformed
+      ],
+    }));
+    const restored = await index._restoreTerminalSessions();
+    assert.deepStrictEqual(restored.map((s: { id: string }) => s.id), ['aaaaaaaaaa'], 'only the valid checkout is restored');
+    assert.deepStrictEqual(terminal.list().map((s: { id: string }) => s.id), ['aaaaaaaaaa'], 'no shell was opened anywhere else');
+    assert.deepStrictEqual(terminal.readSaved().map((s: { id: string }) => s.id), ['aaaaaaaaaa'],
+      'skipped rows are dropped from the saved list');
+  } finally {
+    terminal.closeAll();
+    store.db.repos = store.db.repos.filter((r: { id: string }) => r.id !== repo.id && r.id !== gonePathRepo.id);
+    terminal.flushSaved();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test('sessionAgents: sanitize keeps valid rows, mints slug ids and drops malformed ones', () => {
+  const sessionAgents = require('../server/sessionAgents');
+  assert.deepStrictEqual(sessionAgents.sanitize(undefined), [], 'junk input yields []');
+  assert.deepStrictEqual(sessionAgents.sanitize({ id: 'x' }), [], 'a non-array yields []');
+
+  const out = sessionAgents.sanitize([
+    { label: ' Aider ', command: ' aider --model sonnet ' },
+    { id: 'opus', label: 'Claude Opus', command: 'claude --model opus' },
+    { id: 'opus', label: 'Claude Opus again', command: 'claude --model opus' }, // duplicate id
+    { id: 'Not A Slug!', label: 'Aider', command: 'aider' }, // invalid id, label collides
+    { label: '', command: 'gemini' }, // no label
+    { label: 'Gemini', command: '   ' }, // no command
+    { label: 'Two lines', command: 'gemini\nrm -rf ~' }, // a newline would run a second command
+    { label: 'Escape', command: 'gemini \u001b[2J' }, // a control sequence
+    { label: 'Tab', command: 'gemini\tx' },
+    { label: 'x'.repeat(41), command: 'gemini' }, // label too long
+    { label: 'Long', command: 'a'.repeat(501) }, // command too long
+    { label: 42, command: 'gemini' }, // not a string
+    null,
+    'aider',
+  ]);
+  assert.deepStrictEqual(out, [
+    { id: 'aider', label: 'Aider', command: 'aider --model sonnet' },
+    { id: 'opus', label: 'Claude Opus', command: 'claude --model opus' },
+    { id: 'claude-opus-again', label: 'Claude Opus again', command: 'claude --model opus' },
+    { id: 'aider-2', label: 'Aider', command: 'aider' },
+  ], 'valid rows survive trimmed; ids are kept when valid and unused, minted from the label otherwise');
+
+  const many = Array.from({ length: 30 }, (_, i) => ({ label: `Agent ${i}`, command: 'aider' }));
+  assert.strictEqual(sessionAgents.sanitize(many).length, sessionAgents.MAX_AGENTS, 'the list is capped');
+
+  // find is a lookup by id and nothing else.
+  assert.strictEqual(sessionAgents.find(out, 'opus').command, 'claude --model opus');
+  assert.strictEqual(sessionAgents.find(out, 'nope'), undefined, 'an unknown id is not found');
+  assert.strictEqual(sessionAgents.find(out, 'claude --model opus'), undefined, 'a command is not an id');
+  assert.strictEqual(sessionAgents.find(out, 42), undefined, 'nor is a non-string');
+});
+
+test('sessionAgents: the PATH check reads the program name and executes nothing', () => {
+  const sessionAgents = require('../server/sessionAgents');
+  assert.strictEqual(sessionAgents.programOf('aider --model sonnet'), 'aider');
+  assert.strictEqual(sessionAgents.programOf('FOO=1 BAR=2 opencode run'), 'opencode', 'leading env assignments are skipped');
+  assert.strictEqual(sessionAgents.programOf("'gemini' -i"), 'gemini', 'one layer of quotes is stripped');
+  if (process.platform === 'win32') return;
+  assert.strictEqual(sessionAgents.found('sh -c true'), true, 'sh is on PATH');
+  assert.strictEqual(sessionAgents.found('/bin/sh -c true'), true, 'an explicit path is checked directly');
+  assert.strictEqual(sessionAgents.found('ployd-no-such-agent-xyz --help'), false, 'a missing program is not found');
+  assert.deepStrictEqual(
+    sessionAgents.availability([{ id: 'a', label: 'A', command: 'sh' }, { id: 'b', label: 'B', command: 'ployd-no-such-agent-xyz' }]),
+    { a: true, b: false },
+  );
+});
+
+test('index: PATCH /api/settings sanitizes session agents and reports which are on PATH', async () => {
+  const store = require('../server/store');
+  const index = require('../server/index');
+  const prev = store.db.settings.sessionAgents;
+  const { server, port } = await index.start(0);
+  try {
+    assert.deepStrictEqual(store.DEFAULT_SETTINGS.sessionAgents, [], 'empty by default');
+    const res = await fetch(`http://127.0.0.1:${port}/api/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionAgents: [
+          { label: 'Shell agent', command: 'sh' },
+          { label: 'Missing', command: 'ployd-no-such-agent-xyz' },
+          { label: 'Bad', command: 'sh\necho pwned' },
+        ],
+      }),
+    });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.deepStrictEqual(body.sessionAgents, [
+      { id: 'shell-agent', label: 'Shell agent', command: 'sh' },
+      { id: 'missing', label: 'Missing', command: 'ployd-no-such-agent-xyz' },
+    ], 'the multi-line row is dropped');
+    assert.deepStrictEqual(store.db.settings.sessionAgents, body.sessionAgents, 'and that is what is stored');
+    if (process.platform !== 'win32') {
+      assert.deepStrictEqual(body.sessionAgentsFound, { 'shell-agent': true, missing: false });
+    }
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    store.db.settings.sessionAgents = prev;
+  }
+});
+
+test('terminal: a custom agent session is labeled and numbered after its Settings label', () => {
+  const terminal = require('../server/terminal');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-term-'));
+  const agent = { id: 'aider', label: 'Aider', command: 'true' };
+  try {
+    const s = terminal.create({ cwd: dir, repoId: 'r1', kind: 'custom', agent });
+    assert.strictEqual(s.kind, 'custom');
+    assert.strictEqual(s.agentId, 'aider', 'the id travels to the board, so the tab can be duplicated');
+    assert.strictEqual(s.label, 'Aider');
+    assert.strictEqual(s.command, undefined, 'it is not a package-script session');
+    assert.strictEqual(terminal.create({ cwd: dir, repoId: 'r1', kind: 'custom', agent }).label, 'Aider 2');
+    assert.strictEqual(terminal.create({ cwd: dir, repoId: 'r2', kind: 'custom', agent }).label, 'Aider', 'numbered per repo');
+  } finally {
+    terminal.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('index: the terminal route starts a custom agent by id only, with the command from Settings', async () => {
+  const store = require('../server/store');
+  const index = require('../server/index');
+  const terminal = require('../server/terminal');
+  const { server, port } = await index.start(0);
+  const post = (p: string, body: unknown) => fetch(`http://127.0.0.1:${port}${p}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ployd-agent-repo-'));
+  const repo = { id: store.id(), path: dir, name: 's/agents', branch: null, addedAt: store.now() };
+  store.db.repos.push(repo);
+  const prev = store.db.settings.sessionAgents;
+  // The arithmetic only expands if the shell actually runs the line, so the
+  // marker can't come from the prompt echoing what was typed.
+  const saved = 'echo PLOYD_AGENT_$((6*7))_OK';
+  store.db.settings.sessionAgents = [{ id: 'marker', label: 'Marker', command: saved }];
+  try {
+    const unknown = await post(`/api/repos/${repo.id}/terminal`, { kind: 'custom', agentId: 'nope' });
+    assert.strictEqual(unknown.status, 404, 'an unknown agent id is refused');
+    assert.match((await unknown.json()).error, /No such session agent/);
+    assert.strictEqual((await post(`/api/repos/${repo.id}/terminal`, { kind: 'custom' })).status, 404,
+      'so is a custom session with no id');
+    assert.strictEqual((await post(`/api/repos/${repo.id}/terminal`, { kind: 'custom', agentId: saved })).status, 404,
+      'and a command where the id should be');
+    assert.strictEqual((await post(`/api/repos/${repo.id}/terminal`, { agentId: 'marker', path: '/etc' })).status, 404,
+      'the checkout guard still applies');
+
+    // A `command` in the body is never typed: the line comes from Settings.
+    const res = await post(`/api/repos/${repo.id}/terminal`, {
+      kind: 'custom', agentId: 'marker', command: 'echo PLOYD_PWNED_$((1+1))',
+    });
+    assert.strictEqual(res.status, 200);
+    const s = await res.json();
+    assert.strictEqual(s.kind, 'custom');
+    assert.strictEqual(s.agentId, 'marker');
+    assert.strictEqual(s.label, 'Marker');
+    assert.strictEqual(s.command, undefined);
+
+    if (process.platform !== 'win32') {
+      let out = '';
+      const sub: { off?: () => void } = {};
+      const ran = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 20000);
+        sub.off = terminal.attach(s.id, (b64: string) => {
+          out += Buffer.from(b64, 'base64').toString('utf8');
+          if (out.includes('PLOYD_AGENT_42_OK')) { clearTimeout(timer); resolve(true); }
+        }) || undefined;
+      });
+      sub.off?.();
+      assert.ok(ran, `the saved command ran in the session (output: ${JSON.stringify(out.slice(-400))})`);
+      assert.ok(!out.includes('PLOYD_PWNED'), 'the body command was never typed');
+    }
+  } finally {
+    terminal.closeAll();
+    await new Promise<void>((r) => server.close(() => r()));
+    store.db.repos = store.db.repos.filter((r: { id: string }) => r.id !== repo.id);
+    store.db.settings.sessionAgents = prev;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

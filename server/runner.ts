@@ -1,8 +1,12 @@
 import type { ChildProcess } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 import readline from 'readline';
 
 import { spawnCompat } from './spawnCompat';
-import { db, save, now, appendLog } from './store';
+import { db, save, flush, now, appendLog, getTask } from './store';
+import * as detached from './detached';
+import type { RunKind, RunRecord } from './detached';
 import { broadcast } from './bus';
 import * as groomer from './groomer';
 import * as orchestrator from './orchestrator';
@@ -18,7 +22,7 @@ import * as grok from './agents/grok';
 import { ClaudeAdapter } from './agents/claude';
 import { CodexAdapter } from './agents/codex';
 import { GrokAdapter } from './agents/grok';
-import type { AgentAdapter, NormalizedResult } from './agents/types';
+import type { AgentAdapter, NormalizedResult, PromptDelivery } from './agents/types';
 import type { GroomSpec } from './groomer';
 import type { AskSession, Grooming, LogEvent, Orchestration, PrInfo, Task, TaskAgent } from './types';
 
@@ -41,9 +45,28 @@ function adapterFor(agent: TaskAgent | undefined): AgentAdapter {
 // resource monitor (see liveChildren).
 type RunningChild = ChildProcess & { wasStopped?: boolean; startedAt?: string };
 
-// taskId / groomingId -> child process (tasks and groomings share the pool, so
+// One entry in the shared pool of live runs. An attached run is its
+// ChildProcess itself. A detached run (see launchDetached) is a small handle
+// instead — after a restart there is no ChildProcess at all — whose kill()
+// signals the run's whole process group, and whose `detached` is the watcher
+// tailing its output file.
+interface LiveRun {
+  readonly pid?: number;
+  startedAt?: string;
+  wasStopped?: boolean;
+  kill(signal?: NodeJS.Signals): unknown;
+  detached?: DetachedRun;
+}
+
+// taskId / groomingId -> live run (tasks and groomings share the pool, so
 // runningCount measures every live agent child against the parallel cap).
-const running = new Map<string, RunningChild>();
+const running = new Map<string, LiveRun>();
+
+// How often a detached run's output file is polled for new lines.
+const POLL_MS = 250;
+// A reattached run (no ChildProcess, so no 'exit' event) is checked for life
+// every this many polls.
+const ALIVE_EVERY = 4;
 
 // The session-tracking fields Task and Grooming share — everything launch()
 // needs to stream an agent child into the log + SSE bus. `status` is the
@@ -121,6 +144,8 @@ function record(rec: SessionRecord, event: LogEvent): void {
 }
 
 interface ExitInfo {
+  // null when unknown — a detached run that ended while the server was down
+  // (the server is no longer its parent, so it never sees the exit status).
   code: number | null;
   signal: NodeJS.Signals | null;
   stopped: boolean;
@@ -128,6 +153,14 @@ interface ExitInfo {
   // exited without ever emitting one — e.g. a crash or a launch failure).
   sawResult: NormalizedResult | null;
   stderrTail: string;
+  // A failure reason to use instead of "<cli> exited with code N" when there is
+  // no exit code to quote (a detached run that died without a result).
+  fallbackError?: string;
+}
+
+// "exit 0" for a log line, or "exit unknown" when the code was never seen.
+function exitText(code: number | null): string {
+  return `exit ${code === null ? 'unknown' : code}`;
 }
 
 interface LaunchOpts {
@@ -153,6 +186,100 @@ interface LaunchOpts {
   // it would clobber task.sessionId and break follow-ups and Autonomous Mode's
   // review pass, which both resume the implementing session.
   trackSession?: boolean;
+  // Set by the run types that may be detached (dispatch, codeReview): what a
+  // later server needs to finish the run from its record alone. Only acted on
+  // when Settings.detachedRuns is on and the platform supports it.
+  detach?: { kind: RunKind; implementationSessionId?: string | null };
+}
+
+// Whether a run that CAN be detached should be, right now.
+function detachedEnabled(): boolean {
+  return !!db.settings.detachedRuns && detached.supported();
+}
+
+// What the agent's stream has told us so far, plus the per-line handlers that
+// update it. Shared by the pipe path, the detached watcher, and reattach's
+// replay, so all three read a stream exactly the same way.
+interface StreamState {
+  sawResult: NormalizedResult | null;
+  stderrTail: string;
+  openSubagents: Set<string>;
+  // Set whenever a line changed the record (and so asked for a save). A detached
+  // run flushes db.json before moving its read offset past such a line.
+  dirty: boolean;
+}
+
+interface Stream {
+  st: StreamState;
+  line: (line: string) => void;
+  errLine: (line: string) => void;
+  replay: (line: string) => void;
+}
+
+function streamInto<T extends SessionRecord>(
+  rec: T,
+  adapter: AgentAdapter,
+  emit: (rec: any) => void,
+  onResult: ((event: Record<string, unknown>) => void) | undefined,
+  trackSession: boolean,
+): Stream {
+  const st: StreamState = { sawResult: null, stderrTail: '', openSubagents: new Set(), dirty: false };
+  const changed = (): void => {
+    st.dirty = true;
+    emit(rec);
+  };
+  return {
+    st,
+    line(line: string): void {
+      const norm = adapter.parseLine(line);
+      if (!norm) return;
+
+      // Keep hot record fields in sync with the session stream.
+      if (norm.session) {
+        if (trackSession) rec.sessionId = norm.session.sessionId || rec.sessionId;
+        rec.resolvedModel = norm.session.model || rec.resolvedModel;
+        changed();
+      }
+      if (norm.subagentsOpened) {
+        for (const id of norm.subagentsOpened) {
+          st.openSubagents.add(id);
+          rec.activeSubagents = st.openSubagents.size;
+          changed();
+        }
+      }
+      if (norm.subagentsClosed) {
+        for (const id of norm.subagentsClosed) {
+          if (st.openSubagents.delete(id)) {
+            rec.activeSubagents = st.openSubagents.size;
+            changed();
+          }
+        }
+      }
+      if (norm.result) {
+        st.sawResult = norm.result;
+        rec.costUsd = (rec.costUsd || 0) + (norm.result.costUsd || 0);
+        rec.numTurns = norm.result.numTurns;
+        rec.durationMs = norm.result.durationMs;
+        if (onResult) onResult(norm.result.usageEvent);
+        changed();
+      }
+
+      record(rec, norm.log);
+    },
+    errLine(line: string): void {
+      st.stderrTail = (st.stderrTail + '\n' + line).slice(-4000);
+      record(rec, { type: 'stderr', text: line });
+    },
+    // A line a previous server already handled: rebuild what it told us (the
+    // open subagents, the result) without recording, billing or saving again.
+    replay(line: string): void {
+      const norm = adapter.parseLine(line);
+      if (!norm) return;
+      for (const id of norm.subagentsOpened || []) st.openSubagents.add(id);
+      for (const id of norm.subagentsClosed || []) st.openSubagents.delete(id);
+      if (norm.result) st.sawResult = norm.result;
+    },
+  };
 }
 
 /**
@@ -162,8 +289,12 @@ interface LaunchOpts {
  * fields, and provides `resolveExit`, which decides the final status once the
  * process exits. The runner reacts only to the adapter's NormalizedEvents, so it
  * stays provider-agnostic; the process error/cleanup path is handled here.
+ *
+ * A dispatch or Code Review run is handed to launchDetached instead when
+ * Settings.detachedRuns is on (see docs/specs/detached-runner.md).
  */
-function launch<T extends SessionRecord>(rec: T, { adapter, args, workDir, prompt, promptEvent, emit, resolveExit, onResult, trackSession = true }: LaunchOpts): T {
+function launch<T extends SessionRecord>(rec: T, opts: LaunchOpts): T {
+  const { adapter, args, workDir, prompt, promptEvent, emit, resolveExit, onResult, trackSession = true } = opts;
   if (running.has(rec.id)) throw new Error('Task is already running');
 
   record(rec, promptEvent);
@@ -183,6 +314,8 @@ function launch<T extends SessionRecord>(rec: T, { adapter, args, workDir, promp
       console.warn('[runner] prompt cleanup failed:', (e as Error).message);
     }
   };
+
+  if (opts.detach && detachedEnabled()) return launchDetached(rec, opts, delivery, cleanupPrompt);
 
   let child: RunningChild;
   try {
@@ -207,66 +340,16 @@ function launch<T extends SessionRecord>(rec: T, { adapter, args, workDir, promp
   if (!delivery) child.stdin?.write(prompt);
   child.stdin?.end();
 
-  let sawResult: NormalizedResult | null = null;
-  let stderrTail = '';
-  const openSubagents = new Set<string>();
-
-  const rl = readline.createInterface({ input: child.stdout! });
-  rl.on('line', (line) => {
-    const norm = adapter.parseLine(line);
-    if (!norm) return;
-
-    // Keep hot record fields in sync with the session stream.
-    if (norm.session) {
-      if (trackSession) rec.sessionId = norm.session.sessionId || rec.sessionId;
-      rec.resolvedModel = norm.session.model || rec.resolvedModel;
-      emit(rec);
-    }
-    if (norm.subagentsOpened) {
-      for (const id of norm.subagentsOpened) {
-        openSubagents.add(id);
-        rec.activeSubagents = openSubagents.size;
-        emit(rec);
-      }
-    }
-    if (norm.subagentsClosed) {
-      for (const id of norm.subagentsClosed) {
-        if (openSubagents.delete(id)) {
-          rec.activeSubagents = openSubagents.size;
-          emit(rec);
-        }
-      }
-    }
-    if (norm.result) {
-      sawResult = norm.result;
-      rec.costUsd = (rec.costUsd || 0) + (norm.result.costUsd || 0);
-      rec.numTurns = norm.result.numTurns;
-      rec.durationMs = norm.result.durationMs;
-      if (onResult) onResult(norm.result.usageEvent);
-      emit(rec);
-    }
-
-    record(rec, norm.log);
-  });
-
-  const rlErr = readline.createInterface({ input: child.stderr! });
-  rlErr.on('line', (line) => {
-    stderrTail = (stderrTail + '\n' + line).slice(-4000);
-    record(rec, { type: 'stderr', text: line });
-  });
+  const stream = streamInto(rec, adapter, emit, onResult, trackSession);
+  readline.createInterface({ input: child.stdout! }).on('line', stream.line);
+  readline.createInterface({ input: child.stderr! }).on('line', stream.errLine);
 
   child.on('error', (err) => {
     running.delete(rec.id);
     // The child never started, so nothing will read the prompt file. ('exit' may
     // or may not follow an 'error'; cleanupPrompt is idempotent either way.)
     cleanupPrompt();
-    rec.status = 'failed';
-    rec.lastOutcome = 'error';
-    rec.lastError = `Failed to launch ${adapter.label}: ${err.message}`;
-    rec.finishedAt = now();
-    rec.activeSubagents = 0;
-    record(rec, { type: 'proc', text: rec.lastError });
-    emit(rec);
+    failLaunch(rec, adapter, err, emit);
   });
 
   child.on('exit', (code, signal) => {
@@ -276,9 +359,232 @@ function launch<T extends SessionRecord>(rec: T, { adapter, args, workDir, promp
     permissions.rejectForTask(rec.id, 'Run ended');
     rec.finishedAt = now();
     rec.activeSubagents = 0;
-    resolveExit({ code, signal, stopped: !!child.wasStopped, sawResult, stderrTail });
+    resolveExit({ code, signal, stopped: !!child.wasStopped, sawResult: stream.st.sawResult, stderrTail: stream.st.stderrTail });
     emit(rec);
   });
+
+  return rec;
+}
+
+// The child could not be started at all (e.g. the CLI is not installed).
+function failLaunch(rec: SessionRecord, adapter: AgentAdapter, err: Error, emit: (rec: any) => void): void {
+  rec.status = 'failed';
+  rec.lastOutcome = 'error';
+  rec.lastError = `Failed to launch ${adapter.label}: ${err.message}`;
+  rec.finishedAt = now();
+  rec.activeSubagents = 0;
+  record(rec, { type: 'proc', text: rec.lastError });
+  emit(rec);
+}
+
+// The watcher of one detached run: tails its output files into the stream
+// handlers and finishes the run once it is known to have ended.
+interface DetachedRun {
+  record: RunRecord;
+  // Read whatever is left and settle the run (resolveExit, cleanup, record removal).
+  finish(opts: { code: number | null; fallbackError?: string }): void;
+  // Stop watching but leave the process running (the server is quitting).
+  detach(): void;
+  // Remember that the user stopped it — on disk, so it survives a restart.
+  markStopped(): void;
+}
+
+function watchRun<T extends SessionRecord>(
+  rec: T,
+  runRec: RunRecord,
+  stream: Stream,
+  { resolveExit, emit, cleanup, checkAlive }: {
+    resolveExit: (info: ExitInfo) => void;
+    emit: (rec: any) => void;
+    cleanup?: () => void;
+    // True for a reattached run: there is no 'exit' event, so poll for life.
+    checkAlive: boolean;
+  },
+): DetachedRun {
+  let done = false;
+  let ticks = 0;
+
+  const persist = (): void => {
+    try {
+      detached.writeRecord(runRec);
+    } catch (e) {
+      console.warn('[runner] could not save a detached run record:', (e as Error).message);
+    }
+  };
+
+  // Handle every complete new line, then move the offsets past them. If a line
+  // changed the task, db.json is written first, so a crash can never leave the
+  // offset ahead of the task state it produced.
+  const drain = (final: boolean): void => {
+    const out = detached.readLines(runRec.stdoutPath, runRec.offset, final);
+    const err = detached.readLines(runRec.stderrPath, runRec.errOffset, final);
+    if (out.offset === runRec.offset && err.offset === runRec.errOffset) return;
+    stream.st.dirty = false;
+    for (const line of out.lines) stream.line(line);
+    for (const line of err.lines) stream.errLine(line);
+    if (stream.st.dirty) flush();
+    runRec.offset = out.offset;
+    runRec.errOffset = err.offset;
+    persist();
+  };
+
+  const run: DetachedRun = {
+    record: runRec,
+    finish({ code, fallbackError }) {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      try {
+        drain(true);
+      } catch (e) {
+        console.warn('[runner] could not read the end of a detached run:', (e as Error).message);
+      }
+      if (running.get(rec.id)?.detached === run) running.delete(rec.id);
+      if (cleanup) cleanup();
+      // Deny any prompts still waiting — the child that asked is gone.
+      permissions.rejectForTask(rec.id, 'Run ended');
+      rec.finishedAt = now();
+      rec.activeSubagents = 0;
+      // The outcome comes from the stream (and a recorded stop), never from a
+      // signal: after a restart there is no exit status to read, and the
+      // attached path of a detached run must reach the same verdict.
+      resolveExit({
+        code,
+        signal: null,
+        stopped: !!runRec.stopped,
+        sawResult: stream.st.sawResult,
+        stderrTail: stream.st.stderrTail,
+        fallbackError,
+      });
+      emit(rec);
+      // Only forget the run once its final state is on disk; otherwise a crash
+      // right here would leave a `running` task with no record (→ failed).
+      try {
+        flush();
+      } catch (e) {
+        console.warn('[runner] could not save db.json:', (e as Error).message);
+      }
+      detached.removeRun(runRec);
+    },
+    detach() {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      persist();
+      if (running.get(rec.id)?.detached === run) running.delete(rec.id);
+    },
+    markStopped() {
+      runRec.stopped = true;
+      persist();
+    },
+  };
+
+  const timer = setInterval(() => {
+    try {
+      drain(false);
+    } catch (e) {
+      console.warn('[runner] could not read a detached run:', (e as Error).message);
+    }
+    if (checkAlive && ++ticks % ALIVE_EVERY === 0 && !detached.pidExists(runRec.pid)) {
+      run.finish({ code: null, fallbackError: 'The run ended without a result (its exit code is unknown after a restart)' });
+    }
+  }, POLL_MS);
+  // A detached run is meant to outlive this process; never hold it open.
+  timer.unref();
+  return run;
+}
+
+/**
+ * The detached variant of launch() (Settings.detachedRuns, dispatch and Code
+ * Review only — see docs/specs/detached-runner.md). The child gets its own
+ * process group, reads its prompt from a file, and writes its output to files,
+ * so it no longer needs this server to be alive. A record next to those files
+ * lets a later server reattach to it (reattachAll).
+ */
+function launchDetached<T extends SessionRecord>(
+  rec: T,
+  opts: LaunchOpts,
+  delivery: PromptDelivery | null,
+  cleanupPrompt: () => void,
+): T {
+  const { adapter, args, workDir, prompt, emit, resolveExit, onResult, trackSession = true } = opts;
+  const dir = detached.runDir(rec.id);
+  const stdoutPath = path.join(dir, 'stdout.ndjson');
+  const stderrPath = path.join(dir, 'stderr.log');
+  // The prompt goes in as a file rather than a pipe: the child reads all of it
+  // on its own time, so the server dying mid-write can't truncate it.
+  const stdinPath = delivery ? null : path.join(dir, 'prompt.txt');
+
+  const fds: number[] = [];
+  let child: ChildProcess;
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (stdinPath) fs.writeFileSync(stdinPath, prompt, { mode: 0o600 });
+    const inFd = stdinPath ? fs.openSync(stdinPath, 'r') : null;
+    if (inFd !== null) fds.push(inFd);
+    const outFd = fs.openSync(stdoutPath, 'w', 0o600);
+    fds.push(outFd);
+    const errFd = fs.openSync(stderrPath, 'w', 0o600);
+    fds.push(errFd);
+    child = spawnCompat(adapter.bin, delivery ? [...args, ...delivery.args] : args, {
+      cwd: workDir,
+      env: adapter.childEnv(rec.model),
+      stdio: [inFd === null ? 'ignore' : inFd, outFd, errFd],
+      detached: true,
+    });
+  } catch (e) {
+    cleanupPrompt();
+    detached.removeRun({ dir, tempFiles: [] });
+    throw e;
+  } finally {
+    // The child holds its own copies; ours are not needed.
+    for (const fd of fds) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  }
+  child.unref();
+
+  const pid = child.pid;
+  const runRec: RunRecord = {
+    taskId: rec.id,
+    kind: opts.detach!.kind,
+    agent: adapter.id,
+    pid: pid ?? 0,
+    startTime: pid ? detached.processStartTime(pid) : null,
+    dir,
+    stdinPath,
+    stdoutPath,
+    stderrPath,
+    offset: 0,
+    errOffset: 0,
+    tempFiles: (delivery && delivery.tempFiles) || [],
+    implementationSessionId: opts.detach!.implementationSessionId ?? null,
+    stopped: false,
+    startedAt: now(),
+  };
+  // No pid means the spawn failed ('error' follows); there is nothing to reattach to.
+  if (pid) detached.writeRecord(runRec);
+
+  const stream = streamInto(rec, adapter, emit, onResult, trackSession);
+  const run = watchRun(rec, runRec, stream, { resolveExit, emit, cleanup: cleanupPrompt, checkAlive: false });
+  const live: LiveRun = {
+    pid,
+    startedAt: runRec.startedAt,
+    kill: (signal) => { if (pid) detached.killGroup(pid, signal || 'SIGTERM'); },
+    detached: run,
+  };
+  running.set(rec.id, live);
+
+  child.on('error', (err) => {
+    run.detach();
+    running.delete(rec.id);
+    cleanupPrompt();
+    detached.removeRun(runRec);
+    failLaunch(rec, adapter, err, emit);
+  });
+  // While this server is still the parent it does see the exit; it then reads
+  // what's left of the output and settles the run exactly as reattach would.
+  child.on('exit', (code) => run.finish({ code }));
 
   return rec;
 }
@@ -398,45 +704,55 @@ function codeReview(task: Task, pr: PrInfo): Task {
     emit: emitTask,
     trackSession: false,
     onResult: (event) => usage.applyResult(task, event),
-    resolveExit: ({ code, signal, stopped, sawResult, stderrTail }) => {
-      task.sessionId = implementationSessionId;
-      // Whatever happened, the human validates from here — never `failed`.
-      task.status = 'validation';
-      if (signal || stopped) {
-        task.lastOutcome = 'review-stopped';
-        task.lastError = 'Code review stopped by user';
-        record(task, { type: 'proc', text: 'Code review stopped by user — left in Validation' });
-        return;
-      }
-      const succeeded = sawResult && !sawResult.isError;
-      const verdict = succeeded ? reviewer.parseVerdict(sawResult.text) : null;
-      if (verdict) {
-        reviewer.applyVerdict(task, verdict);
-        task.lastOutcome = 'reviewed';
-        record(task, {
-          type: 'proc',
-          text: `Code review finished — mergeable ${verdict.grade}/5 (${reviewer.gradeMeaning(verdict.grade)})`,
-        });
-        // Best-effort: the grade lives on the task regardless of whether GitHub
-        // accepted the label.
-        github.setMergeableLabel(task, verdict.grade)
-          .then((res) => {
-            if (!res.ok) record(task, { type: 'proc', text: `Could not label the PR (${res.reason})` });
-          })
-          .catch((e) => console.warn('[reviewer] failed to label the PR:', (e as Error).message));
-      } else if (succeeded) {
-        task.lastOutcome = 'reviewed';
-        record(task, { type: 'proc', text: 'Code review finished but produced no readable grade — left ungraded' });
-      } else {
-        task.lastOutcome = 'review-error';
-        task.lastError =
-          (sawResult && sawResult.errorReason) ||
-          stderrTail.trim().split('\n').pop() ||
-          `${adapter.label} exited with code ${code}`;
-        record(task, { type: 'proc', text: `Code review failed (exit ${code}): ${task.lastError}` });
-      }
-    },
+    resolveExit: codeReviewExit(task, implementationSessionId),
+    detach: { kind: 'codeReview', implementationSessionId },
   });
+}
+
+// How a Code Review run settles the task. A factory rather than a closure in
+// codeReview() so a server that restarted mid-review can rebuild it from the
+// run record alone (see reattachAll).
+function codeReviewExit(task: Task, implementationSessionId: string | null): (info: ExitInfo) => void {
+  const adapter = ClaudeAdapter;
+  return ({ code, signal, stopped, sawResult, stderrTail, fallbackError }) => {
+    task.sessionId = implementationSessionId;
+    // Whatever happened, the human validates from here — never `failed`.
+    task.status = 'validation';
+    if (signal || stopped) {
+      task.lastOutcome = 'review-stopped';
+      task.lastError = 'Code review stopped by user';
+      record(task, { type: 'proc', text: 'Code review stopped by user — left in Validation' });
+      return;
+    }
+    const succeeded = sawResult && !sawResult.isError;
+    const verdict = succeeded ? reviewer.parseVerdict(sawResult.text) : null;
+    if (verdict) {
+      reviewer.applyVerdict(task, verdict);
+      task.lastOutcome = 'reviewed';
+      record(task, {
+        type: 'proc',
+        text: `Code review finished — mergeable ${verdict.grade}/5 (${reviewer.gradeMeaning(verdict.grade)})`,
+      });
+      // Best-effort: the grade lives on the task regardless of whether GitHub
+      // accepted the label.
+      github.setMergeableLabel(task, verdict.grade)
+        .then((res) => {
+          if (!res.ok) record(task, { type: 'proc', text: `Could not label the PR (${res.reason})` });
+        })
+        .catch((e) => console.warn('[reviewer] failed to label the PR:', (e as Error).message));
+    } else if (succeeded) {
+      task.lastOutcome = 'reviewed';
+      record(task, { type: 'proc', text: 'Code review finished but produced no readable grade — left ungraded' });
+    } else {
+      task.lastOutcome = 'review-error';
+      task.lastError =
+        (sawResult && sawResult.errorReason) ||
+        stderrTail.trim().split('\n').pop() ||
+        fallbackError ||
+        `${adapter.label} exited with code ${code}`;
+      record(task, { type: 'proc', text: `Code review failed (${exitText(code)}): ${task.lastError}` });
+    }
+  };
 }
 
 /**
@@ -512,33 +828,112 @@ function dispatch(task: Task, prompt: string, { resume = false }: { resume?: boo
     promptEvent: { type: 'prompt', text: prompt, resume, run: task.runCount },
     emit: emitTask,
     onResult: (event) => usage.applyResult(task, event),
-    resolveExit: ({ code, signal, stopped, sawResult, stderrTail }) => {
-      if (signal || stopped) {
-        task.status = 'ready';
-        task.lastOutcome = 'stopped';
-        task.lastError = 'Stopped by user';
-        record(task, { type: 'proc', text: 'Run stopped by user' });
-      } else if (sawResult && !sawResult.isError) {
-        // The work landed: park it in `validation` for the human, then — only when
-        // the task opted into grading and has an open PR — flow on into the Code
-        // Review stage, which emits the `code_review` flip itself once its (async)
-        // PR lookup comes back.
-        task.status = 'validation';
-        task.lastOutcome = 'success';
-        record(task, { type: 'proc', text: `Run finished (exit ${code})` });
-        maybeDistill(task);
-        maybeCodeReview(task);
-      } else {
-        task.status = 'failed';
-        task.lastOutcome = 'error';
-        task.lastError =
-          (sawResult && sawResult.errorReason) ||
-          stderrTail.trim().split('\n').pop() ||
-          `${adapter.label} exited with code ${code}`;
-        record(task, { type: 'proc', text: `Run failed (exit ${code}): ${task.lastError}` });
-      }
-    },
+    resolveExit: dispatchExit(task, adapter),
+    detach: { kind: 'dispatch' },
   });
+}
+
+// How a dispatched run settles the task. A factory rather than a closure in
+// dispatch() so a server that restarted mid-run can rebuild it from the run
+// record alone (see reattachAll).
+function dispatchExit(task: Task, adapter: AgentAdapter): (info: ExitInfo) => void {
+  return ({ code, signal, stopped, sawResult, stderrTail, fallbackError }) => {
+    if (signal || stopped) {
+      task.status = 'ready';
+      task.lastOutcome = 'stopped';
+      task.lastError = 'Stopped by user';
+      record(task, { type: 'proc', text: 'Run stopped by user' });
+    } else if (sawResult && !sawResult.isError) {
+      // The work landed: park it in `validation` for the human, then — only when
+      // the task opted into grading and has an open PR — flow on into the Code
+      // Review stage, which emits the `code_review` flip itself once its (async)
+      // PR lookup comes back.
+      task.status = 'validation';
+      task.lastOutcome = 'success';
+      record(task, { type: 'proc', text: `Run finished (${exitText(code)})` });
+      maybeDistill(task);
+      maybeCodeReview(task);
+    } else {
+      task.status = 'failed';
+      task.lastOutcome = 'error';
+      task.lastError =
+        (sawResult && sawResult.errorReason) ||
+        stderrTail.trim().split('\n').pop() ||
+        fallbackError ||
+        `${adapter.label} exited with code ${code}`;
+      record(task, { type: 'proc', text: `Run failed (${exitText(code)}): ${task.lastError}` });
+    }
+  };
+}
+
+/**
+ * Boot-time pickup of detached runs (docs/specs/detached-runner.md). Called once
+ * by index.start() before the server listens — so a permission bridge retrying
+ * through the restart finds its task live again. For each run record:
+ *   - the lines the previous server already handled are replayed only to
+ *     rebuild state (open subagents, a result already seen) — nothing is logged,
+ *     billed or saved twice;
+ *   - a process that is still alive (pid exists AND its start time matches) is
+ *     put back in the live pool and tailed from the saved offset;
+ *   - a process that is gone is finished from the rest of its output file: with
+ *     a result event it lands exactly as a normal exit would (success branch,
+ *     memory, Code Review hand-off), without one it fails with a clear line.
+ * Runs regardless of Settings.detachedRuns: a record on disk describes a real
+ * process that was started detached, whatever the setting says now.
+ */
+function reattachAll(): { reattached: string[]; finished: string[] } {
+  const out = { reattached: [] as string[], finished: [] as string[] };
+  for (const runRec of detached.listRecords()) {
+    const task = getTask(runRec.taskId);
+    if (!task || (task.status !== 'running' && task.status !== 'code_review') || running.has(task.id)) {
+      // Nothing on the board owns this run any more (the task was settled after
+      // its last save, or deleted). Never kill what we can't account for; just
+      // stop tracking it.
+      if (detached.isAlive(runRec.pid, runRec.startTime)) {
+        console.warn(`[runner] a detached run (pid ${runRec.pid}) has no live task; leaving it alone`);
+      }
+      detached.removeRun(runRec);
+      continue;
+    }
+
+    const isReview = runRec.kind === 'codeReview';
+    const adapter = isReview ? ClaudeAdapter : adapterFor(runRec.agent || task.agent);
+    const base = isReview
+      ? codeReviewExit(task, runRec.implementationSessionId ?? null)
+      : dispatchExit(task, adapter);
+    const resolveExit = (info: ExitInfo): void => {
+      base(info);
+      // The conflict watcher (server/conflicts.ts) lived in the old process, so
+      // nobody else will drop the "Resolving Conflicts" label once this lands.
+      if (task.status !== 'running' && task.status !== 'code_review') task.resolvingConflicts = false;
+    };
+
+    const stream = streamInto(task, adapter, emitTask, (event) => usage.applyResult(task, event), !isReview);
+    for (const line of detached.readHandled(runRec.stdoutPath, runRec.offset)) stream.replay(line);
+    stream.st.stderrTail = detached.readTail(runRec.stderrPath, runRec.errOffset);
+    task.activeSubagents = stream.st.openSubagents.size;
+
+    const alive = detached.isAlive(runRec.pid, runRec.startTime);
+    const run = watchRun(task, runRec, stream, { resolveExit, emit: emitTask, checkAlive: true });
+    running.set(task.id, {
+      pid: runRec.pid,
+      startedAt: runRec.startedAt,
+      // Only ever signal a process we just proved is ours.
+      kill: (signal) => { if (alive) detached.killGroup(runRec.pid, signal || 'SIGTERM'); },
+      detached: run,
+    });
+
+    if (alive) {
+      record(task, { type: 'proc', text: 'Ployd restarted — reattached to the live run' });
+      emitTask(task);
+      out.reattached.push(task.id);
+    } else {
+      record(task, { type: 'proc', text: 'Ployd restarted — the run ended while it was down; reading its output' });
+      run.finish({ code: null, fallbackError: 'The run ended while Ployd was not running, without a result' });
+      out.finished.push(task.id);
+    }
+  }
+  return out;
 }
 
 /**
@@ -827,19 +1222,45 @@ function ask(session: AskSession, question: string, projectMemory: string | null
   });
 }
 
+// Stop a live run. For a detached run kill() signals its whole process group —
+// the agent and everything it started — and works the same before and after a
+// restart, since it needs only the pid; the stop is also written to the run
+// record, so one that lands just before a restart is still a stop.
 function stop(taskId: string): boolean {
   const child = running.get(taskId);
   if (!child) return false;
   child.wasStopped = true;
+  if (child.detached) child.detached.markStopped();
   child.kill('SIGTERM');
   setTimeout(() => {
-    if (running.has(taskId)) child.kill('SIGKILL');
+    if (running.get(taskId) === child) child.kill('SIGKILL');
   }, 5000);
   return true;
 }
 
 function stopAll(): void {
   for (const [taskId] of running) stop(taskId);
+}
+
+/**
+ * The server is going away (Electron quit — including relaunching into an
+ * update — or the dev server's SIGINT). With Settings.detachedRuns on, detached
+ * runs are left running and only stop being watched: their offsets are already
+ * on disk, and the next boot reattaches them. Everything attached is stopped as
+ * before. With the setting off this is stopAll(), except that a detached run
+ * left over from when it was on is not recorded as a user stop — the next boot
+ * then fails it, which is exactly what a quit did before.
+ */
+function shutdown(): void {
+  const keepDetached = detachedEnabled();
+  for (const [taskId, child] of [...running]) {
+    if (child.detached) {
+      child.detached.detach();
+      if (!keepDetached) child.kill('SIGTERM');
+      continue;
+    }
+    stop(taskId);
+  }
 }
 
 // Set the server base URL for the Claude permission bridge (the only backend
@@ -857,6 +1278,9 @@ export {
   ask,
   stop,
   stopAll,
+  shutdown,
+  reattachAll,
+  detachedEnabled,
   isRunning,
   runningCount,
   liveChildren,
@@ -881,6 +1305,7 @@ export const {
   PERMISSION_TOOL,
   DEFAULT_ALLOWED_TOOLS,
   CLAUDE_BIN,
+  resolvedBaseUrl,
 } = claude;
 
 // The non-Claude binaries, for the health probe (GET /api/health checks every backend).

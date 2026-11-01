@@ -1,9 +1,14 @@
+import fs from 'fs';
+import path from 'path';
 import { spawn } from 'child_process';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { Writable } from 'stream';
+import { StatusParser, applyEvent, onInput, reportedStatus, QUERY_REPLY } from './programStatus';
+import type { Reported } from './programStatus';
 import * as bus from './bus';
-import { id } from './store';
+import { id, db, DATA_DIR } from './store';
 import * as runner from './runner';
+import type { SessionAgent } from './types';
 
 // In-app shell sessions. Each session is a real interactive shell running on a
 // pseudo-terminal so prompts, colors, and full-screen apps (vim, top) work. We
@@ -12,21 +17,35 @@ import * as runner from './runner';
 // the only dep). python3 ships on macOS dev machines (Command Line Tools) and
 // virtually all Linux; Windows has no pty here and falls back to a plain pipe.
 //
-// A session can boot straight into an agent CLI (`kind`) or into a command
+// A session can boot straight into an agent CLI (`kind`), into one of the
+// user's own agents from Settings (`kind: 'custom'` + `agent`, looked up by id
+// in the route — never a command from the request), or into a command
 // (`command`, e.g. the `npm run dev` behind the workspace's Run button): the
 // shell starts as usual and the line is typed into it, so quitting `claude` —
 // or Ctrl-C'ing the dev server — leaves you at a live prompt instead of killing
 // the tab.
 //
-// Sessions are process-local and never persisted — like interactive permission
-// prompts, they only make sense while this server is up. They die with it; the
-// board lists the survivors via GET /api/terminal/sessions and reattaches to
-// each one's output with the stream route.
+// The processes are process-local (they die with this server), but the *list*
+// of live sessions is persisted: terminal-sessions.json under PLOYD_DATA_DIR,
+// no scrollback. On the next boot restore() brings each one back as a fresh
+// login shell at the same checkout, under the same id and label, so the board's
+// tabs still point at it. Whatever ran inside (an agent CLI, a package script)
+// is not resumed; a dim notice at the top of the new pane says so. The board
+// lists sessions via GET /api/terminal/sessions and reattaches to each one's
+// output with the stream route.
+//
+// A session also knows who it is: its shell starts with PLOYD_SESSION_ID (and
+// PLOYD_URL), and a claude session is handed the board MCP server on a
+// per-session URL, so a task the agent creates is linked back here
+// (task.originSessionId). When that task lands, server/sessionNotify.ts types
+// a one-line notice into the session; this module only reports what it needs
+// to decide when (notifyTarget) and does the write.
 
-type Kind = 'shell' | 'claude' | 'codex' | 'grok';
+type Kind = 'shell' | 'claude' | 'codex' | 'grok' | 'custom';
 // active = alive and printing; idle = alive but quiet (sitting at a prompt,
-// waiting for you); exited = the process is gone. The board renders them as a
-// green / amber / red bullet.
+// waiting for you), unless the agent inside reports its own state through
+// OSC 7501 (see statusOf); exited = the process is gone. The board renders them
+// as a green / amber / red bullet.
 type Status = 'active' | 'idle' | 'exited';
 
 interface Session {
@@ -41,6 +60,8 @@ interface Session {
   // The line typed at the fresh prompt for a command session (a package
   // script), else undefined. Kept so the board can label and re-run it.
   command?: string;
+  // The Settings id of a custom agent session, so the board can duplicate it.
+  agentId?: string;
   child: ChildProcessWithoutNullStreams;
   // The relay's resize channel (fd 3); null on Windows, which has no pty here.
   control: Writable | null;
@@ -54,6 +75,26 @@ interface Session {
   lastActivity: number;
   // The status last broadcast, so the sweep below only emits real transitions.
   status: Status;
+  // Whether the program in front last switched bracketed paste on
+  // (`ESC [?2004h`). Session notices (server/sessionNotify.ts) are framed as a
+  // paste when it is, since a TUI like claude's treats a burst of typed text
+  // ending in Enter as a paste and doesn't submit it.
+  pasteMode: boolean;
+  // True while the user has typed into the session since their last Enter /
+  // Ctrl-C / Ctrl-U, i.e. there is probably a half-written line in the input
+  // box. A notice waits for it rather than being glued onto it and submitted.
+  draft: boolean;
+  // Raw output since the last input, capped to a few KB: roughly what the
+  // program drew last. Session notices read it to hold off while a menu or a
+  // yes/no prompt is showing, where their Enter would pick an option instead of
+  // sending a message.
+  tail: Buffer;
+  // What the program inside last said it was doing through OSC 7501 (see
+  // server/programStatus.ts), or null when nothing has reported — or the
+  // report has since ended. While set, it decides the status, not the timer.
+  reported: Reported | null;
+  // Finds those reports in the output, carrying a sequence cut across reads.
+  statusParser: StatusParser;
 }
 
 interface Summary {
@@ -63,6 +104,7 @@ interface Summary {
   kind: Kind;
   label: string;
   command?: string;
+  agentId?: string;
   status: Status;
   createdAt: string;
 }
@@ -77,13 +119,74 @@ const SWEEP_MS = 5_000;
 // until dismissed. Cap how many we hold so a long day doesn't grow forever.
 const MAX_EXITED = 20;
 
+// The saved list of live sessions (see the header comment). A sibling of
+// db.json rather than a field in it: it is runtime state nothing reads through
+// /api/state, and it changes on every shell exit, so there's no reason to
+// rewrite the whole db for it.
+const SAVED_PATH = path.join(DATA_DIR, 'terminal-sessions.json');
+// Debounced like store.save, but a little longer: a shell that dies *because*
+// the server is going down (a Ctrl-C reaching the relay too) must not get the
+// chance to drop itself from the list before the process is gone.
+const SAVE_DEBOUNCE_MS = 250;
+
 const KIND_LABEL: Record<Kind, string> = {
-  shell: 'Shell', claude: 'Claude', codex: 'Codex', grok: 'Grok',
+  shell: 'Shell', claude: 'Claude', codex: 'Codex', grok: 'Grok', custom: 'Agent',
 };
 
 function isKind(v: unknown): v is Kind {
-  return v === 'shell' || v === 'claude' || v === 'codex' || v === 'grok';
+  return v === 'shell' || v === 'claude' || v === 'codex' || v === 'grok' || v === 'custom';
 }
+
+// The MCP server name a Ployd-started claude session gets for the board (see
+// startupLine). Named like the one users register by hand (`claude mcp add
+// --transport http ployd …`), so the agent sees one board, not two.
+const SESSION_MCP_NAME = 'ployd';
+
+// The environment every session's shell starts with, on top of the runner's
+// hardened env. PLOYD_SESSION_ID is what an agent passes as create_task's
+// `origin_session` so the task can report back here; PLOYD_URL is the board.
+function sessionEnv(sid: string): Record<string, string> {
+  return { PLOYD_SESSION_ID: sid, PLOYD_URL: runner.resolvedBaseUrl() };
+}
+
+// The line typed at a fresh session's prompt, or null for a plain shell. A
+// command session types its command. A claude session also gets the board MCP
+// server on a per-session URL (`/mcp?session=<id>`), so every task it creates
+// is linked back to it with no setup at all — not even a global
+// `claude mcp add`. It rides the same /mcp route and guards as any other MCP
+// client; the query only tags which session asked. Skipped while
+// Settings.notifySessions is off, so the typed line is exactly what it was.
+function startupLine(kind: Kind, sid: string, command?: string): string | null {
+  if (command) return command;
+  const bin = launchBin(kind);
+  if (!bin) return null;
+  if (kind === 'claude' && db.settings.notifySessions !== false) {
+    const config = JSON.stringify({
+      mcpServers: { [SESSION_MCP_NAME]: { type: 'http', url: `${runner.resolvedBaseUrl()}/mcp?session=${encodeURIComponent(sid)}` } },
+    });
+    return `${shQuote(bin)} --mcp-config ${shQuote(config)}`;
+  }
+  return shQuote(bin);
+}
+
+// Does this write leave a half-typed line in the input box? The last
+// line-ending (Enter), Ctrl-C or Ctrl-U clears it; any printable character
+// after that starts one. Escape sequences (arrow keys, focus reports, the
+// bracketed-paste markers) are skipped — the text inside a paste still counts.
+function draftAfter(prev: boolean, data: string): boolean {
+  // eslint-disable-next-line no-control-regex -- skipping escape sequences is the point
+  const plain = data.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|O.|.)/g, '');
+  let draft = prev;
+  for (const ch of plain) {
+    if (ch === '\r' || ch === '\n' || ch === '\x03' || ch === '\x15') draft = false;
+    else if (ch >= ' ' && ch !== '\x7f') draft = true;
+  }
+  return draft;
+}
+
+const TAIL_BYTES = 8 * 1024;
+const PASTE_ON = Buffer.from('\x1b[?2004h');
+const PASTE_OFF = Buffer.from('\x1b[?2004l');
 
 // The binary a non-shell session types at its prompt. Uses the same resolved
 // bin names the runner spawns tasks with, so a custom CLI path works here too.
@@ -101,15 +204,33 @@ function shQuote(s: string): string {
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+// Two sources: an agent that speaks OSC 7501 says itself whether it is working
+// (and a silent, thinking agent stays active); anything else is graded by the
+// silence timer.
 function statusOf(s: Session): Status {
   if (s.exited) return 'exited';
-  return Date.now() - s.lastActivity > IDLE_MS ? 'idle' : 'active';
+  const quiet = Date.now() - s.lastActivity;
+  if (s.reported) return reportedStatus(s.reported, quiet);
+  return quiet > IDLE_MS ? 'idle' : 'active';
+}
+
+// Reads OSC 7501 out of a chunk of pty output. The only thing ever written back
+// is the protocol's fixed feature-detection reply, and only on a real pty (the
+// Windows pipe fallback has no terminal to speak for).
+function trackStatus(s: Session, chunk: Buffer): void {
+  for (const e of s.statusParser.feed(chunk)) {
+    if (e.type === 'query') {
+      if (s.control && !s.exited) s.child.stdin.write(QUERY_REPLY);
+    } else {
+      applyEvent(s, e);
+    }
+  }
 }
 
 function summary(s: Session): Summary {
   return {
     id: s.id, repoId: s.repoId, cwd: s.cwd, kind: s.kind,
-    label: s.label, command: s.command, status: statusOf(s), createdAt: s.createdAt,
+    label: s.label, command: s.command, agentId: s.agentId, status: statusOf(s), createdAt: s.createdAt,
   };
 }
 
@@ -240,32 +361,38 @@ function trimExited(): void {
 // the shell process can't be spawned. `command` types one line at the fresh
 // prompt (a package script — server/scripts.ts builds it); it is a plain shell
 // either way, so the session outlives whatever it started.
+//
+// `restored` is internal to restore() and never reachable from a route: it
+// reuses the saved id, label and creation time, and prints `notice` at the top
+// of the pane.
 function create(opts: {
+  agent?: SessionAgent;
   cwd: string; repoId: string; kind?: Kind; command?: string; cols?: number; rows?: number;
+  restored?: { id: string; label: string; base: string; createdAt: string; notice: string };
 }): Summary {
-  const { cwd, repoId } = opts;
+  const { cwd, repoId, restored } = opts;
   const kind: Kind = isKind(opts.kind) ? opts.kind : 'shell';
   const command = typeof opts.command === 'string' && opts.command.trim() ? opts.command.trim() : undefined;
-  const sid = id();
+  const sid = restored && !sessions.has(restored.id) ? restored.id : id();
   const shell = process.env.SHELL || '/bin/bash';
   const { cmd, args } = ptyCommand(shell, opts.cols || 80, opts.rows || 24);
   const child = spawn(cmd, args, {
     cwd,
     // Reuse the task-runner env hardening: strip the API key (so `claude` in
     // the terminal uses the subscription login) and nested-session markers.
-    env: { ...runner.childEnv(), TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    env: { ...runner.childEnv(), ...sessionEnv(sid), TERM: 'xterm-256color', COLORTERM: 'truecolor' },
     // The fourth pipe is the relay's resize channel (see PTY_RELAY).
     stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
   }) as ChildProcessWithoutNullStreams;
   const control = (child.stdio[3] as Writable | undefined) ?? null;
 
-  const base = command || KIND_LABEL[kind];
+  const base = restored ? restored.base : (command || KIND_LABEL[kind]);
   const session: Session = {
     id: sid,
     repoId,
     cwd,
     kind,
-    label: labelFor(repoId, base),
+    label: restored ? restored.label : labelFor(repoId, base),
     base,
     command,
     child,
@@ -274,10 +401,24 @@ function create(opts: {
     bufferBytes: 0,
     listeners: new Set(),
     exited: false,
-    createdAt: new Date().toISOString(),
+    reported: null,
+    statusParser: new StatusParser(),
+    createdAt: restored ? restored.createdAt : new Date().toISOString(),
     lastActivity: Date.now(),
     status: 'active',
+    pasteMode: false,
+    draft: false,
+    tail: Buffer.alloc(0),
   };
+  // A custom agent session is named after its Settings label and numbered the
+  // same way ("Aider", "Aider 2"), and types that agent's saved command.
+  const { agent } = opts;
+  if (agent) {
+    session.kind = 'custom';
+    session.agentId = agent.id;
+    session.base = agent.label;
+    session.label = labelFor(repoId, agent.label);
+  }
   sessions.set(sid, session);
 
   const emit = (chunk: Buffer) => {
@@ -288,9 +429,18 @@ function create(opts: {
       session.bufferBytes -= session.buffer.shift()!.length;
     }
     session.lastActivity = Date.now();
-    if (session.status !== 'active') announce(session);
+    // The last of the two markers in this chunk wins.
+    const on = chunk.lastIndexOf(PASTE_ON);
+    const off = chunk.lastIndexOf(PASTE_OFF);
+    if (on !== off) session.pasteMode = on > off;
+    session.tail = Buffer.concat([session.tail, chunk]).subarray(-TAIL_BYTES);
+    trackStatus(session, chunk);
+    if (statusOf(session) !== session.status) announce(session);
     for (const fn of session.listeners) fn(b64);
   };
+  // A restored session's notice goes first in the buffer, so it is the top line
+  // of the pane, above the new shell's prompt, on every replay.
+  if (restored) emit(Buffer.from(`\x1b[2m${restored.notice}\x1b[0m\r\n`));
   child.stdout.on('data', emit);
   child.stderr.on('data', emit);
   const onDead = () => {
@@ -299,6 +449,7 @@ function create(opts: {
     for (const fn of session.listeners) fn('');
     announce(session);
     trimExited();
+    persist();
   };
   child.on('exit', onDead);
   child.on('error', onDead);
@@ -306,12 +457,12 @@ function create(opts: {
   // Type the agent CLI (or the package script) at the fresh prompt rather than
   // exec'ing it, so the tab survives quitting the agent / stopping the script.
   // The pty buffers this until the shell reads it.
-  const bin = launchBin(kind);
-  const startup = command || (bin ? shQuote(bin) : null);
+  const startup = startupLine(kind, sid, command || agent?.command);
   if (startup) child.stdin.write(`${startup}\n`);
 
   syncSweep();
   bus.broadcast({ type: 'terminal', session: summary(session) });
+  persist();
   return summary(session);
 }
 
@@ -344,8 +495,45 @@ function write(sid: string, data: string): boolean {
   if (!s || s.exited) return false;
   s.child.stdin.write(data);
   s.lastActivity = Date.now();
-  if (s.status !== 'active') announce(s);
+  s.draft = draftAfter(s.draft, data);
+  // Input answers (or closes) whatever was on screen, so the tail restarts:
+  // what the program draws next is what a notice will look at. Otherwise a
+  // closed menu's text lingers in it until enough new output pushes it out.
+  s.tail = Buffer.alloc(0);
+  onInput(s, data);
+  if (statusOf(s) !== s.status) announce(s);
   return true;
+}
+
+// A session that exists and hasn't exited — what an `origin_session` must name
+// before a task is linked to it (server/mcp.ts).
+function isLive(sid: string): boolean {
+  const s = sessions.get(sid);
+  return !!s && !s.exited;
+}
+
+// What server/sessionNotify.ts needs to decide whether a notice can be typed
+// into a session right now. `pid` is the relay's (the shell is its child).
+interface NotifyTarget {
+  id: string;
+  kind: Kind;
+  // Which Settings agent a `custom` session runs (see Session.agentId).
+  agentId?: string;
+  label: string;
+  status: Status;
+  pid: number | null;
+  pasteMode: boolean;
+  draft: boolean;
+  // The raw tail of the session's output (see Session.tail).
+  tail: string;
+}
+function notifyTarget(sid: string): NotifyTarget | null {
+  const s = sessions.get(sid);
+  if (!s) return null;
+  return {
+    id: s.id, kind: s.kind, agentId: s.agentId, label: s.label, status: statusOf(s),
+    pid: s.child.pid ?? null, pasteMode: s.pasteMode, draft: s.draft, tail: s.tail.toString('utf8'),
+  };
 }
 
 // Live resize: a real TIOCSWINSZ on the pty master, so the shell gets SIGWINCH
@@ -368,6 +556,7 @@ function close(sid: string): void {
   for (const fn of s.listeners) fn('');
   announce(s);
   trimExited();
+  persist();
 }
 
 // Kills (if needed) and forgets a session entirely — the tab's × and the
@@ -380,11 +569,141 @@ function remove(sid: string): void {
   sessions.delete(sid);
   syncSweep();
   bus.broadcast({ type: 'terminal-removed', id: sid });
+  persist();
 }
 
+// Shutdown (app quit, auto-update relaunch, Ctrl-C on the dev server): write the
+// live list as it stands *first*, then kill every shell without letting those
+// deaths reach the file. They are the server going away, not the user closing
+// tabs, and the next boot should restore exactly what was open.
 function closeAll(): void {
-  for (const sid of [...sessions.keys()]) remove(sid);
+  flushSaved();
+  suspended = true;
+  try {
+    for (const sid of [...sessions.keys()]) remove(sid);
+  } finally {
+    suspended = false;
+  }
 }
 
-export { create, get, list, attach, write, resize, close, remove, closeAll, isKind };
-export type { Kind, Status, Summary };
+// ---------- persistence: the list of live sessions, restored on boot ----------
+
+// One row per live session. `kind`/`command` are what it was started as, kept
+// only so the restore notice can say what didn't come back.
+interface SavedSession {
+  id: string;
+  repoId: string;
+  cwd: string;
+  kind: Kind;
+  label: string;
+  base: string;
+  command?: string;
+  createdAt: string;
+}
+
+let saveTimer: NodeJS.Timeout | null = null;
+let suspended = false;
+
+function savedRows(): SavedSession[] {
+  return [...sessions.values()]
+    .filter((s) => !s.exited)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .map((s) => ({
+      id: s.id, repoId: s.repoId, cwd: s.cwd, kind: s.kind,
+      label: s.label, base: s.base, command: s.command, createdAt: s.createdAt,
+    }));
+}
+
+// Writes the live list now, atomically (temp file + rename, like db.json).
+// Best effort: a failed write must never take a terminal route down with it.
+function flushSaved(): void {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (suspended) return;
+  try {
+    const tmp = SAVED_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, sessions: savedRows() }, null, 2));
+    fs.renameSync(tmp, SAVED_PATH);
+  } catch (e) {
+    console.error('[terminal] failed to save the session list:', (e as Error).message);
+  }
+}
+
+// Called on every change to the live set: create, close, remove, exit.
+function persist(): void {
+  if (suspended || saveTimer) return;
+  saveTimer = setTimeout(flushSaved, SAVE_DEBOUNCE_MS);
+  saveTimer.unref();
+}
+
+// The saved list as written, minus any malformed row. A missing or unreadable
+// file means there is nothing to restore.
+function readSaved(): SavedSession[] {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(SAVED_PATH, 'utf8'));
+  } catch {
+    return [];
+  }
+  const rows = (raw as { sessions?: unknown } | null)?.sessions;
+  if (!Array.isArray(rows)) return [];
+  const str = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+  const seen = new Set<string>();
+  const out: SavedSession[] = [];
+  for (const r of rows as Array<Record<string, unknown> | null>) {
+    if (!r || !str(r.id) || !/^[\w-]{1,64}$/.test(r.id) || seen.has(r.id)) continue;
+    if (!str(r.repoId) || !str(r.cwd) || !isKind(r.kind) || !str(r.label)) continue;
+    seen.add(r.id);
+    out.push({
+      id: r.id, repoId: r.repoId, cwd: r.cwd, kind: r.kind, label: r.label,
+      base: str(r.base) ? r.base : r.label,
+      command: str(r.command) ? r.command : undefined,
+      createdAt: str(r.createdAt) ? r.createdAt : new Date().toISOString(),
+    });
+  }
+  return out;
+}
+
+function noticeFor(s: SavedSession): string {
+  if (s.command) return `Restored after restart. "${s.command}" was not restarted.`;
+  // A custom agent is named by its own label ("Aider"), not the generic "Agent".
+  const what = s.kind === 'custom' ? s.base : KIND_LABEL[s.kind];
+  if (s.kind !== 'shell') return `Restored after restart. The previous ${what} session ended.`;
+  return 'Restored after restart.';
+}
+
+// Boot: recreate each saved session as a plain login shell at its checkout,
+// under its old id and label. `resolveCwd` is the caller's checkout check (the
+// same one the terminal routes use); a row it rejects (repo unregistered,
+// worktree removed, directory gone) is skipped, so the saved file can never
+// open a shell anywhere a route couldn't. A restored session is a `shell` with
+// no command: nothing is typed at its prompt, and the board must not show an
+// agent or a play glyph for something that is no longer running.
+async function restore(
+  resolveCwd: (repoId: string, cwd: string) => Promise<string | null>,
+): Promise<Summary[]> {
+  const restored: Summary[] = [];
+  for (const s of readSaved()) {
+    let cwd: string | null = null;
+    try {
+      cwd = await resolveCwd(s.repoId, s.cwd);
+    } catch {
+      cwd = null;
+    }
+    if (!cwd) continue;
+    try {
+      restored.push(create({
+        cwd, repoId: s.repoId, kind: 'shell',
+        restored: { id: s.id, label: s.label, base: s.base, createdAt: s.createdAt, notice: noticeFor(s) },
+      }));
+    } catch (e) {
+      console.error('[terminal] failed to restore a session:', (e as Error).message);
+    }
+  }
+  // Rewrite the list now, so skipped rows are gone even if nothing else changes.
+  flushSaved();
+  return restored;
+}
+
+export { create, get, list, attach, write, resize, close, remove, closeAll, isKind, restore, flushSaved, readSaved, SAVED_PATH };
+export { isLive, notifyTarget, startupLine, sessionEnv, draftAfter };
+export type { Kind, Status, Summary, SavedSession, NotifyTarget };

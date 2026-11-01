@@ -28,6 +28,19 @@ export interface CustomModel {
   env: Record<string, string>;
 }
 
+// A user-defined agent command for in-app terminal sessions (Settings → General
+// → Session agents), e.g. `aider` or `claude --model opus`. The board starts a
+// session with one by sending its `id`; the server looks `command` up here and
+// types it at the fresh shell's prompt. See server/sessionAgents.ts.
+export interface SessionAgent {
+  // A short unique slug, stable across edits of the label or command.
+  id: string;
+  // What the picker, the tab and the sidebar call it ("Aider", then "Aider 2").
+  label: string;
+  // The single line typed at the prompt, verbatim.
+  command: string;
+}
+
 export interface Settings {
   notifications: boolean;
   sounds: boolean;
@@ -38,6 +51,11 @@ export interface Settings {
   // combined) may be alive at once. Dispatch/groom reject once the cap is hit
   // rather than queuing — see runner.runningCount and index.ts's atCapacity.
   maxParallelSessions: number;
+  // When on, task dispatch and Code Review runs are spawned detached (their own
+  // process group, output to files under PLOYD_DATA_DIR/runs) so they survive a
+  // server restart and are reattached on boot. Off by default. Ignored on
+  // Windows, where runs always stay attached. See docs/specs/detached-runner.md.
+  detachedRuns: boolean;
   // Ids of plugins the user installed from the marketplace (see server/plugins.ts).
   // A plugin's features (e.g. the "From Linear" import) only surface once it's here.
   installedPlugins: string[];
@@ -107,6 +125,14 @@ export interface Settings {
   //   0      — no budget (the old behavior)
   //   n      — that many MB
   sessionMemoryMb: number | 'auto';
+  // When on (the default), a task created from a Ployd terminal session (see
+  // Task.originSessionId) reports back: when it lands, server/sessionNotify.ts
+  // types a one-line notice into that session's agent. Also what hands a
+  // Ployd-started claude session the per-session board MCP URL.
+  notifySessions: boolean;
+  // User-defined agent commands the terminal's new-session picker offers after
+  // the built-in kinds. Empty by default. See SessionAgent.
+  sessionAgents: SessionAgent[];
 }
 
 // The redacted, board-facing view of Settings. Omits the raw Linear token and
@@ -117,6 +143,9 @@ export interface PublicSettings {
   sounds: boolean;
   linearConfigured: boolean;
   maxParallelSessions: number;
+  detachedRuns: boolean;
+  // False on Windows, where detachedRuns has no effect (runs stay attached).
+  detachedRunsSupported: boolean;
   installedPlugins: string[];
   mergeStrategy: MergeStrategy;
   autoResolveConflicts: boolean;
@@ -137,6 +166,12 @@ export interface PublicSettings {
   // What 'auto' resolves to on this machine right now (MB), so the board can
   // label the Auto option honestly instead of guessing. Derived, never stored.
   sessionMemoryAutoMb: number;
+  notifySessions: boolean;
+  // Not a secret — returned as-is so Settings can edit them and the picker list them.
+  sessionAgents: SessionAgent[];
+  // id -> whether that agent's program was found on this machine's PATH, so the
+  // picker can mark a missing one. Derived on each read, never stored.
+  sessionAgentsFound: Record<string, boolean>;
 }
 
 // A marketplace plugin as the UI lists it. The full catalog lives in
@@ -393,6 +428,12 @@ export interface Task {
   // Origin pointer for tasks imported from a repo spec file, so the drawer can
   // show where the prompt came from. Present only on the repo-specs import path.
   specOrigin?: { path: string };
+  // The in-app terminal session (server/terminal.ts) whose agent created this
+  // task over MCP, and its label at the time ("Claude 2"). Set only by
+  // create_task, after checking the id names a live session; never editable.
+  // When the task lands, server/sessionNotify.ts types a notice into it.
+  originSessionId?: string;
+  originSessionLabel?: string;
   repoId: string;
   repoName: string;
   repoPath: string;

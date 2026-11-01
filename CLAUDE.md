@@ -26,7 +26,8 @@ static with **no build step** (see Conventions).
 | Path | Role |
 |---|---|
 | `server/index.ts` | Express REST API + static UI host. Binds `127.0.0.1` only. |
-| `server/runner.ts` | Spawns/kills an agent CLI and streams its output. Provider-agnostic: it drives an `AgentAdapter` and reacts to normalized events (see "Agent backends"). |
+| `server/runner.ts` | Spawns/kills an agent CLI and streams its output. Provider-agnostic: it drives an `AgentAdapter` and reacts to normalized events (see "Agent backends"). With `Settings.detachedRuns` on, dispatch and Code Review runs are spawned **detached** and tailed from files, and `reattachAll()` picks them back up on boot (see "Detached runs"). |
+| `server/detached.ts` | The on-disk side of a detached run: its record under `PLOYD_DATA_DIR/runs/`, pid + start-time liveness, process-group kill, and offset tailing of its output file. Parses nothing itself. |
 | `server/agents/types.ts` | The `AgentAdapter` interface + `NormalizedEvent`/`NormalizedResult`/`PromptDelivery` — the seam that lets a task run on `claude`, `codex` or `grok`. |
 | `server/agents/claude.ts` | `ClaudeAdapter`: the `claude` CLI backend (bin, subscription env stripping, `buildArgs`/`groomArgs`, permission-bridge wiring, `stream-json` `parseLine`). A verbatim lift of the old inline runner behavior. |
 | `server/agents/codex.ts` | `CodexAdapter`: the OpenAI Codex CLI backend (`codex exec --json`, stdin prompt, sandbox/approval mapping, `OPENAI_API_KEY` stripping, JSONL `parseLine`). |
@@ -37,9 +38,11 @@ static with **no build step** (see Conventions).
 | `server/tasks.ts` | Task lifecycle service (`createTask`/`dispatchTask` + capacity gate) shared by the REST API and the MCP server, so both queue/run tasks identically. |
 | `server/mcp.ts` | **Board MCP server** (see "MCP server" below). Streamable-HTTP MCP endpoint mounted on the Express app at `POST /mcp` so outside MCP clients can drive the board while Ployd runs. |
 | `server/git.ts` | Worktree lifecycle (`git worktree add/remove`). |
-| `server/terminal.ts` | In-app shell sessions: a pty per session (a python3 relay, no native module), their status, and the resize channel (see "Terminal sessions"). |
+| `server/terminal.ts` | In-app shell sessions: a pty per session (a python3 relay, no native module), their status, the resize channel, and the saved list that restores them after a restart (see "Terminal sessions"). |
+| `server/programStatus.ts` | OSC 7501 (Program Status Protocol) for terminal sessions: a chunk parser for the reports an agent prints, and the rules that turn them into a session's status. Pure; `terminal.ts` owns the side effects (see "Terminal sessions"). |
 | `server/desktop.ts` | Desktop hand-offs for the workspace quick actions: reveal a checkout in the OS file manager, or open it in the user's IDE (see "Workspace quick actions"). |
 | `server/scripts.ts` | Reads a checkout's `package.json` scripts and the package manager that runs them, and turns a script *name* into a command line (see "Package scripts"). Runs nothing itself. |
+| `server/sessionAgents.ts` | The user's own terminal-session agents (`Settings.sessionAgents`): sanitizing the list, the id → command lookup, and the PATH check behind the picker's "not found" mark (see "Terminal sessions"). Runs nothing itself. |
 | `server/resources.ts` | Opt-in resource monitor: samples the OS process table and reports what the app and each live agent session cost this machine (see "Resource monitor"). |
 | `server/github.ts` | `gh` CLI integration: read-only lookup of a task's pull request, its merge-safety check, the merge itself, and the `mergeable/<n>` grade label. |
 | `server/reviewer.ts` | Meta-prompt + verdict parser for the **Code Review** stage (see "Code Review" below). |
@@ -53,6 +56,7 @@ static with **no build step** (see Conventions).
 | `server/groomer.ts` | Meta-prompt + result parser for "Brief an Idea" (see "Grooming" below). |
 | `server/orchestrator.ts` | Meta-prompt + turn-status parser for the orchestrator (see "Goal Orchestration"). |
 | `server/orchestrator-engine.ts` | Orchestrator engine: watches the bus and resumes a waiting orchestrator session when its worker tasks land. |
+| `server/sessionNotify.ts` | Session notices: when a task an interactive agent created from a terminal session lands, types one sanitized `[ployd] task …` line into that session (see "Terminal sessions"). Owns the line, its sanitizer, the per-session queue and the delivery guards. |
 | `server/sentinels.ts` | Tolerant extraction of the sentinel-delimited JSON `groomer.ts`, `orchestrator.ts` and `reviewer.ts` end a turn with. |
 | `server/types.ts` | Shared interfaces (`Task`, `Repo`, `Db`, `Decision`, …). Typing only. |
 | `server/paths.ts` | Resolves the app root (`public/`, `assets/`, `build/`) from source or `dist/`. |
@@ -115,6 +119,48 @@ lifecycle — see "Grooming" below — and live in their own locked, leftmost co
 Dispatch runs the prompt fresh; a follow-up with an existing `sessionId` resumes the
 same session (`claude --resume`). A worktree is materialized lazily on first dispatch
 when `useWorktree` is set.
+
+With `Settings.detachedRuns` on, a `running` or `code_review` card can outlive the
+server: on boot it is reattached to its still-live process, or settled from the output
+the run left behind (see "Detached runs"). Either way the status is still set only by
+the runner.
+
+## Detached runs: task runs that survive a server restart
+
+Opt-in (`Settings.detachedRuns`, default **off**, a strict boolean in
+`PATCH /api/settings`, toggle in Settings → General → Performance). Off means
+byte-for-byte the old pipe spawn. Spec: `docs/specs/detached-runner.md`.
+
+- **Scope:** `runner.dispatch` and `runner.codeReview` only (they pass `detach` to
+  `launch()`). Grooming, orchestration, Ask and memory distillation stay attached. The
+  setting is read when a run starts; a run keeps the mode it started in.
+- **Spawn:** `launchDetached` starts the CLI with `detached: true` (its own process
+  group). Stdin is a prompt file, stdout/stderr are files in
+  `PLOYD_DATA_DIR/runs/<taskId>-<n>/` — never pipes, so a dead server can't SIGPIPE it.
+  `run.json` there records pid, process start time (`ps -o lstart=`), paths, read
+  offsets, temp files (Grok's prompt file), the review's implementing session id, and
+  `stopped`.
+- **Watching:** the file is polled (250 ms) and every complete line goes through the
+  same `streamInto` handlers the pipe path uses, so the log, ledger and SSE are
+  identical. The offset is written after each batch, and db.json is flushed first when
+  a line changed the task, so nothing is parsed twice and the offset is never ahead of
+  the task.
+- **Outcome:** decided from the stream (a result event) plus a recorded stop — never a
+  signal or exit code, because after a restart the server isn't the parent and can't
+  read one. Both paths of a detached run agree. A detached run killed by a signal
+  nobody sent through Ployd is therefore `failed`, not "stopped by user".
+- **Boot:** `reattachAll()` runs in `index.start()` *before* listening. It replays the
+  already-handled lines for state only (open subagents, a result already seen), then
+  either reattaches (pid alive **and** start time matches) or finishes the run from
+  the rest of the file. It runs whatever the setting says now — a record describes a
+  real detached process.
+- **Stop / quit:** `stop` signals the process **group** (`kill(-pid)`), before and
+  after a restart. `runner.shutdown()` (Electron `before-quit`, dev-server SIGINT)
+  leaves detached runs alone when the setting is on, and is `stopAll()` otherwise.
+- **Windows:** no process groups to signal, so runs stay attached there even with the
+  setting on (the settings checkbox is disabled with a note).
+- The record folder is removed only after the task's final state is flushed to
+  db.json, so a crash mid-finish just finishes it again on the next boot.
 
 ## Code Review: grading the branch before a human looks at it
 
@@ -420,6 +466,12 @@ The wiring:
   `{ behavior:'deny', message }`. Unanswered prompts auto-deny after 30 minutes; a
   stopped/exited run (`runner` exit → `permissions.rejectForTask`) or a dropped bridge
   connection (`res` close) denies any still pending.
+- **Through a restart.** A detached run (see "Detached runs") outlives the server, so the
+  bridge retries a refused/reset POST with backoff (1 s doubling to 10 s) for up to the
+  same 30 minutes, then denies. A retried POST simply re-registers the prompt on the new
+  server. Limitation: the bridge only knows the URL it was started with — a server that
+  comes back on another port of the ladder is never found. The bridge exits when its
+  stdin closes, so it can't linger retrying for a dead run.
 - Pending prompts are **process-local and never persisted** — they only make sense while
   the `claude` child is alive. `GET /api/state` annotates each task with its live
   `pendingPermissions` so a reconnecting board rebuilds the prompts.
@@ -701,9 +753,10 @@ into and operate yourself — including `claude`, `codex` or `grok` running
 interactively. It has no card, no column, and no lifecycle on the board; the whole
 point is that it's the escape hatch *next to* the board, not another thing to manage.
 
-`server/terminal.ts` owns them. They are **process-local and never persisted** (like
-interactive permission prompts): they die with the server, and a reloading board
-rebuilds its tabs from `GET /api/terminal/sessions`.
+`server/terminal.ts` owns them. The **processes** are process-local: they die with the
+server, and a reloading board rebuilds its tabs from `GET /api/terminal/sessions`. The
+**list of live sessions** is persisted, so a restart (app quit, crash, auto-update
+relaunch) doesn't lose the tabs — see "Restored after a restart" below.
 
 - **The pty.** Each session runs the user's login shell on a real pseudo-terminal,
   allocated by a small **python3 relay** (`PTY_RELAY`) rather than a native module
@@ -714,14 +767,62 @@ rebuilds its tabs from `GET /api/terminal/sessions`.
   panel is dragged. The old approach (pushing an `stty` through stdin) only worked at
   a bare prompt and echoed itself across the screen. Windows has no pty here and
   falls back to a plain-pipe `cmd.exe`, where resize is a no-op.
-- **`kind`** (`shell` | `claude` | `codex` | `grok`) is *typed at the shell's prompt*,
-  not exec'd — so quitting the agent leaves you at a live prompt instead of killing
-  the tab. The picker only offers a CLI `/api/health` actually found on this machine.
+- **`kind`** (`shell` | `claude` | `codex` | `grok` | `custom`) is *typed at the shell's
+  prompt*, not exec'd — so quitting the agent leaves you at a live prompt instead of
+  killing the tab. The picker only offers a built-in CLI `/api/health` actually found on
+  this machine.
+- **Custom agents** (`kind: 'custom'`) are the user's own commands — `aider`,
+  `opencode`, `gemini`, `claude --model opus` — saved in `Settings.sessionAgents`
+  (`[{ id, label, command }]`, empty by default) and edited in Settings → General →
+  Session agents (`public/features/settings-modal.js`). `server/sessionAgents.ts`
+  sanitizes the list the way custom models are: a row needs a non-empty label (≤ 40
+  chars) and a single-line command (≤ 500 chars, no control characters), malformed
+  rows are dropped, and an id is kept when it is a valid unused slug, minted from the
+  label otherwise. **The id-only rule** is the Run button's: the board sends
+  `{ kind: 'custom', agentId }`, the route looks the command up in Settings
+  (`sessionAgents.find`), an unknown id is a 404, and a `command` in the body is
+  ignored — `POST /api/repos/:id/terminal` never types a line it got from a request.
+  The session carries `agentId` (so ⌘D duplicates it) and is labeled and numbered
+  after the agent's label ("Aider", "Aider 2"), with the `square-terminal` glyph. The
+  picker lists them after the built-ins under "Your agents", and ⌘K gets a
+  "New <label> Session" per agent. Whether each one's program is on PATH comes from a
+  filesystem lookup (`PublicSettings.sessionAgentsFound`, derived on every read) —
+  never a `--version` probe, since these are arbitrary commands. A missing one is
+  **still offered, dimmed and marked**: the login shell it is typed into may resolve an
+  alias, a function or a PATH entry the server can't see. Like any other agent session,
+  a restart brings it back as a plain shell (no `agentId`), with a notice that names
+  the agent's label.
 - **Status** is the green/amber/red bullet every surface shows: `active` (alive and
-  printing), `idle` (alive but quiet for 30s — sitting at a prompt, waiting for you),
-  `exited` (the process is gone; the tab stays red and its scrollback readable until
-  dismissed). One sweep timer turns "went quiet" into a `terminal` bus event; every
-  other transition is broadcast by whatever caused it.
+  working), `idle` (alive and waiting for you), `exited` (the process is gone; the tab
+  stays red and its scrollback readable until dismissed). A live session's status has
+  two sources:
+  - **The agent's own report (OSC 7501).** An agent that speaks the
+    [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+    (rev 0.4) prints `ESC ] 7501 ; state=<word>:app=<name> ST` (ST is `ESC \` or BEL).
+    `server/programStatus.ts` finds these in the pty output — a sequence cut across two
+    reads is carried over — and passes the bytes through untouched (xterm.js ignores
+    the OSC, so replay and rendering don't change). `working` → `active`; `idle`,
+    `done`, `blocked`, `error` → `idle`. Only the root record (no `id`) counts. Once a
+    session has reported, **the silence timer doesn't override it**: a thinking agent
+    stays green however quiet it is. The report ends — and the timer takes back over —
+    on the agent's own `state=clear` (Claude and Codex send it on exit), a full reset
+    (`ESC c`), a new shell prompt (`OSC 133;A`, if the shell has integration; `done` /
+    `error` survive that, per the spec), a line submitted with Enter while the state is
+    anything but `working` (the agent re-reports `working` the moment it takes the line;
+    a crashed one leaves a plain shell the timer grades), or 10 minutes of total
+    silence on a `working` report (an agent TUI redraws a spinner while it works, so
+    that long means it died without saying so).
+  - **The silence timer**, for everything that never reports: `idle` after 30s with no
+    output. One sweep timer turns "went quiet" into a `terminal` bus event; every other
+    transition (a report included) is broadcast by whatever caused it.
+
+  **Who reports today.** Claude Code (2.1.295+) asks first — `OSC 7501 ; ?` then
+  `CSI c` — and reports only if the 7501 answer arrives before the device-attributes
+  one. xterm.js doesn't answer it, so the server does: `terminal.ts` writes the spec's
+  fixed reply (`QUERY_REPLY`) into the pty, on a real pty only. That's the only thing
+  this feature ever writes into a session. Codex (0.163.0+) reports without asking
+  whenever its stdout is a terminal. Grok 0.2.114 doesn't report, so it stays on the
+  timer. None of them needs a hook, flag or env var, and Ployd sets none.
 - **Closing vs dismissing.** Leaving a session (hiding the panel, or switching to
   another tab) is a *view* change — it keeps running. `POST /api/terminal/:id/close`
   kills the shell but keeps it listed as exited; `DELETE /api/terminal/:id` (the tab's
@@ -732,6 +833,97 @@ rebuilds its tabs from `GET /api/terminal/sessions`.
   own feed and the keystroke POSTs. The client reopens it whenever the set of mounted
   panes changes and repaints from the replay — which is also why a dropped-and-
   reconnected stream doesn't paint the scrollback twice.
+- **Restored after a restart.** Every create / close / dismiss / exit rewrites
+  `terminal-sessions.json` under `PLOYD_DATA_DIR` (a sibling of `db.json`, atomic temp
+  file + rename, debounced 250 ms). It holds only sessions that were **alive** — id,
+  repoId, cwd, kind, label, the label's numbering base, any command, createdAt — and
+  never scrollback. On boot `index.start()` calls `restoreTerminalSessions()` **before
+  listening** (and once per process, since Electron's port ladder can call `start()`
+  again), so the first board to connect already sees them. Each row is recreated as a
+  **plain login shell** at its cwd under the **same id and label**, so `ployd.tabs` in
+  `localStorage` still points at it. Nothing is re-typed: the agent or script is *not*
+  resumed, and the pane opens with a dim notice ("Restored after restart. The previous
+  Claude session ended."). A restored session's `kind` becomes `shell` and its
+  `command` is dropped, so the board shows a terminal glyph rather than claiming an
+  agent or a dev server is running in it; the label is what tells you what it was.
+  Rows are validated through `resolveRepoTarget` (repo still registered, path is the
+  root or a live worktree) plus a directory-exists check, and a row that fails is
+  dropped — so the file can never open a shell anywhere a route couldn't. Exited
+  sessions are never saved, so a red tab is pruned by `pruneTabs()` after a restart.
+  `closeAll()` (Electron's `before-quit`, the dev server's SIGINT) flushes the list
+  *before* killing the shells and keeps those deaths out of the file: the server going
+  away is not the user closing tabs.
+
+### Reporting back: a session hears about the tasks it created
+
+An agent running in a session can queue board tasks through the `/mcp` server (see
+"MCP server"). Ployd remembers which session asked and, when the task lands, types a
+one-line notice into that session, so the agent reads the result as a message and
+nobody copies output between windows. `Settings.notifySessions` (Settings → General →
+Terminal sessions, **on** by default, a strict boolean in `PATCH /api/settings`) turns
+all of it off; off, a claude session's typed line is exactly what it was before.
+
+- **The link** is `task.originSessionId` (plus `originSessionLabel`, the label at the
+  time, which the card's chip shows). Only `create_task` sets it, never `PATCH`, and
+  only after `terminal.isLive` says the id names a session that exists and hasn't
+  exited; anything else is ignored, never an error. Two ways in:
+  - **Automatic, for a claude session.** `terminal.startupLine` types
+    `claude --mcp-config '{"mcpServers":{"ployd":{"type":"http","url":"<base>/mcp?session=<id>"}}}'`,
+    so the agent has the board tools with no `claude mcp add` and every task it creates
+    over that URL is linked. The query only tags the caller: the request still goes
+    through the Host allowlist, the loopback bind and the remote-access gate in front
+    of `/mcp`, like any other client (invariant #1). The server is named `ployd`, like
+    the one users add by hand. No `--strict-mcp-config`: an interactive session keeps
+    the user's own servers.
+  - **By argument, for anything else** (codex, grok, a custom agent, a claude the
+    user started themselves). Every session's shell starts with `PLOYD_SESSION_ID` and `PLOYD_URL`
+    (`terminal.sessionEnv`), and `create_task` takes an optional `origin_session`
+    whose description tells the agent to pass `$PLOYD_SESSION_ID`. The URL's session
+    wins when both are given.
+- **When.** `server/sessionNotify.ts` watches the bus. A linked task reaching
+  `validation`, `failed` or `done` is a landing; `code_review` is still in flight (the
+  orchestrator engine's rule), and a 4 s debounce keeps a run that parks in validation
+  and flows into code review from reporting twice. One notice per landing: the same
+  status re-broadcast is ignored, `validation` → `done` is a landing of its own, and a
+  task dispatched again starts over. Tasks already landed at boot are never announced.
+- **What.** One server-built line:
+  `[ployd] task <id> "<title>" finished: validation, grade 4/5, PR <url> - get_task <id> for details`
+  (`error "<lastError>"` instead of a grade on a failure). **The sanitizing rule is the
+  security-critical part:** every piece of task text (title, error) goes through
+  `sanitizeText` — escape sequences (CSI, OSC/DCS/APC strings, the 8-bit C1 forms)
+  removed whole, every other control character (newlines, CR, ESC, DEL, C1, U+2028/9,
+  zero-width and bidi marks) turned into a space, length capped (title 80, error 160,
+  line 400) — and then `quotedText` drops what a POSIX shell expands inside double
+  quotes (`"` and backquote become `'`; `$`, `\`, `!` go). The PR URL is typed only if
+  it is a plain `https://host/path` with no query or shell characters. So a title can
+  never add a keystroke, end the line early, or run anything even if the line reached a
+  shell. Tests cover hostile titles; keep them passing.
+- **Who.** Only agent sessions (`claude` / `codex` / `grok` / `custom`), never a plain
+  shell — typing into bash runs a command. A custom agent's foreground check matches the
+  program its saved command starts (`sessionAgents.programOf`); one removed from
+  Settings matches nothing, so it gets no notice. An exited (or dismissed) session drops its queue.
+- **How it's delivered.** The notice is queued per session (process-local, capped at
+  10, never persisted) and written only when every guard passes, re-checked right
+  before the write: the session is `idle` (from the agent's own OSC 7501 report when it
+  sends one, otherwise the 30 s silence timer), the user has no half-typed line
+  (`draft`, tracked by `terminal.write`: printable input since the last Enter / Ctrl-C
+  / Ctrl-U), **no menu or yes/no prompt is what the program drew last**
+  (`menuOnScreen` over the output since the last keystroke, capped at 8 KB — input answers or closes a menu, so what is drawn after it is what counts: a highlighted `❯ 1.` / `› 1.` option,
+  "Do you want to…", "Press enter to…", `(y/n)`), and the agent itself is the
+  terminal's foreground program (`agentInForeground`: the shell's `tpgid` from `ps`
+  must be a process group running the agent's bin, so an agent session whose agent was
+  quit back to the shell gets nothing). The menu guard exists because an Enter typed
+  into a picker chooses the highlighted option — a live test typed into codex's
+  "Update available" picker and ran `npm install -g @openai/codex`. It is a heuristic
+  that errs towards waiting. One notice goes out per idle transition; the agent taking
+  it makes the session active, and the next idle sends the next. Windows (no pty, no
+  process groups) never delivers.
+- **The write** is the line as a **bracketed paste** (`ESC[200~ … ESC[201~`) when the
+  program switched that mode on (`terminal.ts` tracks `ESC[?2004h/l` in the output),
+  then Enter (`\r`). Verified against a live interactive `claude` 2.1.316: typed text
+  plus `\r` in one write is taken as a paste and is **not** submitted; the
+  bracketed-paste form is submitted as a user message, with the `\r` in the same write
+  or a separate one.
 
 On the board (`public/features/terminal.js`) a session has **two possible homes, one
 per layout**: a tab in the panel docked at the bottom of the window (classic), or a
@@ -853,6 +1045,14 @@ bridge the CLI spawns to *ask the user* about a tool; this one is a long-lived
 - **No new security boundary.** There's no auth — the endpoint rides the same
   `127.0.0.1`-only bind as `/api`, which *is* the boundary (invariant #1). It exposes
   exactly the task-control power the local REST API already does. Keep it localhost.
+- **Who's asking (`?session=<id>`).** A claude terminal session Ployd starts gets this
+  server on `/mcp?session=<its id>`; `handlePost` passes the id to `callTool` as
+  context, and `create_task` links the new task to that session
+  (`task.originSessionId`) when the id names a live one. `create_task` also takes an
+  optional `origin_session` argument for clients on the plain URL (an agent in a
+  session passes `$PLOYD_SESSION_ID`). Neither is a credential, and neither changes
+  what the request may do — it only decides which session hears back when the task
+  lands. See "Reporting back" under "Terminal sessions".
 - To add a tool, append a `TOOL_DEFS` entry (name + JSON `inputSchema`) and a `case`
   in `callTool`; the pure `respond()` handler and the smoke tests cover the protocol.
 
@@ -977,7 +1177,12 @@ respect the invariants above, run lint + test, and summarize the diff and any ri
   without it, the Windows installer registers a second "Ployd" next to the old one
   instead of upgrading it. Never change or drop `nsis.guid`.
 - Orphaned `running` tasks from a crash are auto-marked `failed` on server start
-  (`store.js`) — don't "fix" that by resurrecting them as running.
+  (`store.ts`, and orphaned `code_review` ones parked in `validation`) — don't "fix"
+  that by resurrecting them as running. The one exception is a task with a detached
+  run record in `PLOYD_DATA_DIR/runs/`: `store.ts` leaves it as it is and
+  `runner.reattachAll()` decides, from the process (pid + start time) and its output
+  file, whether to reattach it, finish it from the result it left, or fail it. A task
+  with no record keeps the old rule.
 - `db.json` is written atomically (temp file + rename) and debounced; go through
   `store.save()` rather than writing it directly.
 - The packaged app runs from a read-only bundle — never write inside the app dir; use

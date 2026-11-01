@@ -623,8 +623,11 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   isQuitting = true;
   try {
-    server.runner.stopAll(); // terminate any live claude processes
-    server.terminal.closeAll(); // kill any in-app shell sessions
+    // Terminate the live agent runs — except, with Settings.detachedRuns on, the
+    // detached ones, which keep going and are reattached on the next launch
+    // (this is also the path a relaunch-into-update takes).
+    server.runner.shutdown();
+    server.terminal.closeAll(); // save the open shell sessions (restored on next boot), then kill them
   } catch (_) { /* nothing to stop */ }
 });
 

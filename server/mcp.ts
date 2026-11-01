@@ -27,6 +27,7 @@ import { db, save, now, getTask, readLog } from './store';
 import * as runner from './runner';
 import * as permissions from './permissions';
 import * as tasks from './tasks';
+import * as terminal from './terminal';
 import { broadcast } from './bus';
 import type { Repo, Task } from './types';
 
@@ -39,7 +40,9 @@ const INSTRUCTIONS =
   'to find a registered repo id, then list_tasks/get_task to inspect work, ' +
   'create_task to queue a prompt, and dispatch_task to run it. Each task runs on its ' +
   'own agent backend (claude, codex or grok). Dispatching spawns a real agent session on ' +
-  'the user\'s machine — confirm intent before starting runs.';
+  'the user\'s machine — confirm intent before starting runs. A task created from ' +
+  'a Ployd terminal session reports back to it: when the task lands, Ployd types a ' +
+  'one-line "[ployd] task …" notice into that session.';
 
 // One MCP tool: its advertised schema plus the id of the arguments it reads.
 const TOOL_DEFS = [
@@ -106,6 +109,7 @@ const TOOL_DEFS = [
         autoCodeReview: { type: 'boolean', description: 'Grade the branch in the Code Review stage (a fresh read-only reviewer that comments on the PR) when the run finishes, before it lands in validation. Off by default.' },
         personas: { type: 'array', items: { type: 'string' }, description: 'Persona ids (see the board).' },
         autoPersona: { type: 'boolean', description: 'Let the run pick its own expert persona from the catalog before it starts, instead of using "personas".' },
+        origin_session: { type: 'string', description: 'The Ployd terminal session you are running in, so Ployd can type a one-line notice into it when this task lands (validation, failed or done). Inside a Ployd terminal session it is the PLOYD_SESSION_ID environment variable (`echo $PLOYD_SESSION_ID`); omit it anywhere else. An unknown or ended session is ignored.' },
       },
       required: ['repoId', 'prompt'],
       additionalProperties: false,
@@ -171,9 +175,30 @@ function textResult(data: unknown): { content: { type: 'text'; text: string }[];
   return { content: [{ type: 'text', text }] };
 }
 
+// Who is calling, as far as the transport can tell. `session` is the
+// `?session=<id>` a Ployd-started claude session's MCP URL carries (see
+// terminal.startupLine). It only tags the caller; the guards in front of /mcp
+// are what decide whether the request is allowed at all.
+interface CallContext {
+  session?: string;
+}
+
+// The terminal session a new task should report back to: the session the MCP
+// URL names, else the `origin_session` argument. Either must name a live
+// session; anything else (a typo, a session that ended, a stray value) is
+// ignored rather than an error, so a bad link never costs the task itself.
+function resolveOrigin(ctx: CallContext, arg: unknown): { sessionId: string; label: string } | null {
+  for (const candidate of [ctx.session, arg]) {
+    if (typeof candidate !== 'string' || !candidate || !terminal.isLive(candidate)) continue;
+    const target = terminal.notifyTarget(candidate);
+    if (target) return { sessionId: target.id, label: target.label };
+  }
+  return null;
+}
+
 // The real tool executor. Throws a plain Error on any failure; respond() turns
 // that into an MCP `isError` tool result so the client sees the message.
-async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+async function callTool(name: string, args: Record<string, unknown>, ctx: CallContext = {}): Promise<unknown> {
   switch (name) {
     case 'list_repos':
       return textResult(db.repos.map(repoView));
@@ -206,8 +231,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       });
     }
 
-    case 'create_task':
-      return textResult(tasks.createTask(args));
+    case 'create_task': {
+      const { origin_session: originArg, ...input } = args;
+      return textResult(tasks.createTask(input, resolveOrigin(ctx, originArg)));
+    }
 
     case 'dispatch_task': {
       const task = getTask(String(args.taskId ?? ''));
@@ -305,9 +332,11 @@ async function handlePost(req: Request, res: Response): Promise<void> {
   const body = req.body;
   const batch = Array.isArray(body);
   const messages: RpcMessage[] = batch ? body : [body];
+  const session = typeof req.query?.session === 'string' ? req.query.session : undefined;
+  const call: typeof callTool = (name, args) => callTool(name, args, { session });
   const replies: object[] = [];
   for (const message of messages) {
-    const reply = await respond(message);
+    const reply = await respond(message, call);
     if (reply) replies.push(reply);
   }
   if (!replies.length) {

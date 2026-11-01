@@ -136,6 +136,9 @@ export function init() {
   $('#setting-isolate-mcp').addEventListener('change', async (e) => {
     await saveSettings({ isolateMcpServers: e.target.checked });
   });
+  $('#setting-detached-runs').addEventListener('change', async (e) => {
+    await saveSettings({ detachedRuns: e.target.checked });
+  });
   $('#setting-merge-strategy').addEventListener('change', async (e) => {
     await saveSettings({ mergeStrategy: e.target.value });
   });
@@ -150,6 +153,9 @@ export function init() {
   });
   $('#setting-memory').addEventListener('change', async (e) => {
     await saveSettings({ memory: e.target.checked });
+  });
+  $('#setting-notify-sessions').addEventListener('change', async (e) => {
+    await saveSettings({ notifySessions: e.target.checked });
   });
   $('#setting-resource-monitor').addEventListener('change', async (e) => {
     await saveSettings({ resourceMonitor: e.target.checked });

@@ -983,6 +983,20 @@
                 </div>
                 <div class="settings-row">
                   <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-detached-runs">Keep task runs going when Ployd quits or restarts</label>
+                    <p class="settings-row-desc">Task runs and code reviews run as their own background processes and
+                      write their output to files, so a quit, a crash or an update relaunch no longer kills them. Ployd
+                      picks them up again when it starts, and finishes any that ended while it was away. Applies to runs
+                      started after you turn it on. Grooming, orchestration and Ask still stop with the app.
+                      <span id="setting-detached-runs-windows">Not available on Windows: runs there always stop with
+                      the app.</span></p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-detached-runs" />
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-row-text">
                     <label class="settings-row-label" for="setting-isolate-mcp">Isolate agent sessions from my MCP servers</label>
                     <p class="settings-row-desc">Otherwise every session connects to all the MCP servers your
                       <code>claude</code> install uses, with a child process for each local one. Sessions still get
@@ -1041,6 +1055,45 @@
                   <div class="settings-row-control">
                     <input type="checkbox" class="switch" role="switch" id="setting-assign-pr-to-self" />
                   </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Terminal sessions</h3>
+              </div>
+              <div class="settings-card">
+                <div class="settings-row">
+                  <div class="settings-row-text">
+                    <label class="settings-row-label" for="setting-notify-sessions">Tell a session's agent when its tasks land</label>
+                    <p class="settings-row-desc">When the agent in a terminal session (Claude, Codex or Grok) creates a
+                      task over Ployd's MCP server, Ployd types one line into that session once the task reaches
+                      Validation, Failed or Done. It waits until the session is idle, nothing is half-typed and no menu
+                      or yes/no prompt is open, and it never types into a plain shell. Claude sessions started here get
+                      Ployd's board tools automatically.</p>
+                  </div>
+                  <div class="settings-row-control">
+                    <input type="checkbox" class="switch" role="switch" id="setting-notify-sessions" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <h3 class="settings-group-title">Session agents</h3>
+                <p class="settings-group-desc">Your own agent commands for terminal sessions, offered in the
+                  new-session picker after Claude, Codex and Grok: <code>aider</code>, <code>opencode</code>,
+                  <code>gemini</code>, <code>claude --model opus</code>. Ployd types the command at a fresh shell's
+                  prompt on the checkout, so quitting the agent leaves you at a live prompt. One line, no secrets.</p>
+              </div>
+              <div class="settings-card settings-form">
+                <div id="session-agents-body" class="session-agents-body"></div>
+                <div class="session-agent-row session-agent-add">
+                  <input id="session-agent-add-label" type="text" maxlength="40" placeholder="Name, e.g. Aider" aria-label="New agent name" />
+                  <input id="session-agent-add-command" class="mono" type="text" maxlength="500" placeholder="Command, e.g. aider --model sonnet" aria-label="New agent command" />
+                  <button class="btn" id="session-agent-add-btn"><span class="i" data-icon="plus"></span>Add</button>
                 </div>
               </div>
             </div>
