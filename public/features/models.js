@@ -151,6 +151,9 @@ export function init() {
   $('#setting-memory').addEventListener('change', async (e) => {
     await saveSettings({ memory: e.target.checked });
   });
+  $('#setting-notify-sessions').addEventListener('change', async (e) => {
+    await saveSettings({ notifySessions: e.target.checked });
+  });
   $('#setting-resource-monitor').addEventListener('change', async (e) => {
     await saveSettings({ resourceMonitor: e.target.checked });
     syncResourceMonitor();

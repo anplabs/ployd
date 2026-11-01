@@ -65,6 +65,9 @@ const DEFAULT_SETTINGS: Settings = {
   // machine's RAM and the parallel-session cap, so several sessions can't each
   // size themselves against the whole machine and push it into swap.
   sessionMemoryMb: 'auto',
+  // On by default: a task an agent session created reports back to it when it
+  // lands (server/sessionNotify.ts). Nothing happens for any other task.
+  notifySessions: true,
 };
 
 let db: Db = { repos: [], tasks: [], groomings: [], orchestrations: [], settings: { ...DEFAULT_SETTINGS } };

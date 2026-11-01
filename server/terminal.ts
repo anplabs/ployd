@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { Writable } from 'stream';
 import * as bus from './bus';
-import { id, DATA_DIR } from './store';
+import { id, db, DATA_DIR } from './store';
 import * as runner from './runner';
 
 // In-app shell sessions. Each session is a real interactive shell running on a
@@ -28,6 +28,13 @@ import * as runner from './runner';
 // is not resumed; a dim notice at the top of the new pane says so. The board
 // lists sessions via GET /api/terminal/sessions and reattaches to each one's
 // output with the stream route.
+//
+// A session also knows who it is: its shell starts with PLOYD_SESSION_ID (and
+// PLOYD_URL), and a claude session is handed the board MCP server on a
+// per-session URL, so a task the agent creates is linked back here
+// (task.originSessionId). When that task lands, server/sessionNotify.ts types
+// a one-line notice into the session; this module only reports what it needs
+// to decide when (notifyTarget) and does the write.
 
 type Kind = 'shell' | 'claude' | 'codex' | 'grok';
 // active = alive and printing; idle = alive but quiet (sitting at a prompt,
@@ -60,6 +67,20 @@ interface Session {
   lastActivity: number;
   // The status last broadcast, so the sweep below only emits real transitions.
   status: Status;
+  // Whether the program in front last switched bracketed paste on
+  // (`ESC [?2004h`). Session notices (server/sessionNotify.ts) are framed as a
+  // paste when it is, since a TUI like claude's treats a burst of typed text
+  // ending in Enter as a paste and doesn't submit it.
+  pasteMode: boolean;
+  // True while the user has typed into the session since their last Enter /
+  // Ctrl-C / Ctrl-U, i.e. there is probably a half-written line in the input
+  // box. A notice waits for it rather than being glued onto it and submitted.
+  draft: boolean;
+  // Raw output since the last input, capped to a few KB: roughly what the
+  // program drew last. Session notices read it to hold off while a menu or a
+  // yes/no prompt is showing, where their Enter would pick an option instead of
+  // sending a message.
+  tail: Buffer;
 }
 
 interface Summary {
@@ -100,6 +121,57 @@ const KIND_LABEL: Record<Kind, string> = {
 function isKind(v: unknown): v is Kind {
   return v === 'shell' || v === 'claude' || v === 'codex' || v === 'grok';
 }
+
+// The MCP server name a Ployd-started claude session gets for the board (see
+// startupLine). Named like the one users register by hand (`claude mcp add
+// --transport http ployd …`), so the agent sees one board, not two.
+const SESSION_MCP_NAME = 'ployd';
+
+// The environment every session's shell starts with, on top of the runner's
+// hardened env. PLOYD_SESSION_ID is what an agent passes as create_task's
+// `origin_session` so the task can report back here; PLOYD_URL is the board.
+function sessionEnv(sid: string): Record<string, string> {
+  return { PLOYD_SESSION_ID: sid, PLOYD_URL: runner.resolvedBaseUrl() };
+}
+
+// The line typed at a fresh session's prompt, or null for a plain shell. A
+// command session types its command. A claude session also gets the board MCP
+// server on a per-session URL (`/mcp?session=<id>`), so every task it creates
+// is linked back to it with no setup at all — not even a global
+// `claude mcp add`. It rides the same /mcp route and guards as any other MCP
+// client; the query only tags which session asked. Skipped while
+// Settings.notifySessions is off, so the typed line is exactly what it was.
+function startupLine(kind: Kind, sid: string, command?: string): string | null {
+  if (command) return command;
+  const bin = launchBin(kind);
+  if (!bin) return null;
+  if (kind === 'claude' && db.settings.notifySessions !== false) {
+    const config = JSON.stringify({
+      mcpServers: { [SESSION_MCP_NAME]: { type: 'http', url: `${runner.resolvedBaseUrl()}/mcp?session=${encodeURIComponent(sid)}` } },
+    });
+    return `${shQuote(bin)} --mcp-config ${shQuote(config)}`;
+  }
+  return shQuote(bin);
+}
+
+// Does this write leave a half-typed line in the input box? The last
+// line-ending (Enter), Ctrl-C or Ctrl-U clears it; any printable character
+// after that starts one. Escape sequences (arrow keys, focus reports, the
+// bracketed-paste markers) are skipped — the text inside a paste still counts.
+function draftAfter(prev: boolean, data: string): boolean {
+  // eslint-disable-next-line no-control-regex -- skipping escape sequences is the point
+  const plain = data.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|O.|.)/g, '');
+  let draft = prev;
+  for (const ch of plain) {
+    if (ch === '\r' || ch === '\n' || ch === '\x03' || ch === '\x15') draft = false;
+    else if (ch >= ' ' && ch !== '\x7f') draft = true;
+  }
+  return draft;
+}
+
+const TAIL_BYTES = 8 * 1024;
+const PASTE_ON = Buffer.from('\x1b[?2004h');
+const PASTE_OFF = Buffer.from('\x1b[?2004l');
 
 // The binary a non-shell session types at its prompt. Uses the same resolved
 // bin names the runner spawns tasks with, so a custom CLI path works here too.
@@ -274,7 +346,7 @@ function create(opts: {
     cwd,
     // Reuse the task-runner env hardening: strip the API key (so `claude` in
     // the terminal uses the subscription login) and nested-session markers.
-    env: { ...runner.childEnv(), TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    env: { ...runner.childEnv(), ...sessionEnv(sid), TERM: 'xterm-256color', COLORTERM: 'truecolor' },
     // The fourth pipe is the relay's resize channel (see PTY_RELAY).
     stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
   }) as ChildProcessWithoutNullStreams;
@@ -298,6 +370,9 @@ function create(opts: {
     createdAt: restored ? restored.createdAt : new Date().toISOString(),
     lastActivity: Date.now(),
     status: 'active',
+    pasteMode: false,
+    draft: false,
+    tail: Buffer.alloc(0),
   };
   sessions.set(sid, session);
 
@@ -309,6 +384,11 @@ function create(opts: {
       session.bufferBytes -= session.buffer.shift()!.length;
     }
     session.lastActivity = Date.now();
+    // The last of the two markers in this chunk wins.
+    const on = chunk.lastIndexOf(PASTE_ON);
+    const off = chunk.lastIndexOf(PASTE_OFF);
+    if (on !== off) session.pasteMode = on > off;
+    session.tail = Buffer.concat([session.tail, chunk]).subarray(-TAIL_BYTES);
     if (session.status !== 'active') announce(session);
     for (const fn of session.listeners) fn(b64);
   };
@@ -331,8 +411,7 @@ function create(opts: {
   // Type the agent CLI (or the package script) at the fresh prompt rather than
   // exec'ing it, so the tab survives quitting the agent / stopping the script.
   // The pty buffers this until the shell reads it.
-  const bin = launchBin(kind);
-  const startup = command || (bin ? shQuote(bin) : null);
+  const startup = startupLine(kind, sid, command);
   if (startup) child.stdin.write(`${startup}\n`);
 
   syncSweep();
@@ -370,8 +449,42 @@ function write(sid: string, data: string): boolean {
   if (!s || s.exited) return false;
   s.child.stdin.write(data);
   s.lastActivity = Date.now();
+  s.draft = draftAfter(s.draft, data);
+  // Input answers (or closes) whatever was on screen, so the tail restarts:
+  // what the program draws next is what a notice will look at. Otherwise a
+  // closed menu's text lingers in it until enough new output pushes it out.
+  s.tail = Buffer.alloc(0);
   if (s.status !== 'active') announce(s);
   return true;
+}
+
+// A session that exists and hasn't exited — what an `origin_session` must name
+// before a task is linked to it (server/mcp.ts).
+function isLive(sid: string): boolean {
+  const s = sessions.get(sid);
+  return !!s && !s.exited;
+}
+
+// What server/sessionNotify.ts needs to decide whether a notice can be typed
+// into a session right now. `pid` is the relay's (the shell is its child).
+interface NotifyTarget {
+  id: string;
+  kind: Kind;
+  label: string;
+  status: Status;
+  pid: number | null;
+  pasteMode: boolean;
+  draft: boolean;
+  // The raw tail of the session's output (see Session.tail).
+  tail: string;
+}
+function notifyTarget(sid: string): NotifyTarget | null {
+  const s = sessions.get(sid);
+  if (!s) return null;
+  return {
+    id: s.id, kind: s.kind, label: s.label, status: statusOf(s),
+    pid: s.child.pid ?? null, pasteMode: s.pasteMode, draft: s.draft, tail: s.tail.toString('utf8'),
+  };
 }
 
 // Live resize: a real TIOCSWINSZ on the pty master, so the shell gets SIGWINCH
@@ -541,4 +654,5 @@ async function restore(
 }
 
 export { create, get, list, attach, write, resize, close, remove, closeAll, isKind, restore, flushSaved, readSaved, SAVED_PATH };
-export type { Kind, Status, Summary, SavedSession };
+export { isLive, notifyTarget, startupLine, sessionEnv, draftAfter };
+export type { Kind, Status, Summary, SavedSession, NotifyTarget };

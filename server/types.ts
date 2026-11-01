@@ -107,6 +107,11 @@ export interface Settings {
   //   0      — no budget (the old behavior)
   //   n      — that many MB
   sessionMemoryMb: number | 'auto';
+  // When on (the default), a task created from a Ployd terminal session (see
+  // Task.originSessionId) reports back: when it lands, server/sessionNotify.ts
+  // types a one-line notice into that session's agent. Also what hands a
+  // Ployd-started claude session the per-session board MCP URL.
+  notifySessions: boolean;
 }
 
 // The redacted, board-facing view of Settings. Omits the raw Linear token and
@@ -137,6 +142,7 @@ export interface PublicSettings {
   // What 'auto' resolves to on this machine right now (MB), so the board can
   // label the Auto option honestly instead of guessing. Derived, never stored.
   sessionMemoryAutoMb: number;
+  notifySessions: boolean;
 }
 
 // A marketplace plugin as the UI lists it. The full catalog lives in
@@ -393,6 +399,12 @@ export interface Task {
   // Origin pointer for tasks imported from a repo spec file, so the drawer can
   // show where the prompt came from. Present only on the repo-specs import path.
   specOrigin?: { path: string };
+  // The in-app terminal session (server/terminal.ts) whose agent created this
+  // task over MCP, and its label at the time ("Claude 2"). Set only by
+  // create_task, after checking the id names a live session; never editable.
+  // When the task lands, server/sessionNotify.ts types a notice into it.
+  originSessionId?: string;
+  originSessionLabel?: string;
   repoId: string;
   repoName: string;
   repoPath: string;

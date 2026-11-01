@@ -72,6 +72,7 @@ function connectSSE() {
         $('#setting-assign-pr-to-self').checked = !!state.settings.assignPrToSelf;
         $('#setting-memory').checked = !!state.settings.memory;
         $('#setting-resource-monitor').checked = resourceMonitorOn();
+        $('#setting-notify-sessions').checked = state.settings.notifySessions !== false;
         renderSessionMemorySetting();
         updateNotifNote();
         renderEditorSetting();

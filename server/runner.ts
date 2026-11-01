@@ -881,6 +881,7 @@ export const {
   PERMISSION_TOOL,
   DEFAULT_ALLOWED_TOOLS,
   CLAUDE_BIN,
+  resolvedBaseUrl,
 } = claude;
 
 // The non-Claude binaries, for the health probe (GET /api/health checks every backend).

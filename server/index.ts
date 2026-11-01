@@ -23,6 +23,7 @@ import * as personas from './personas';
 import * as groomer from './groomer';
 import * as orchestrator from './orchestrator';
 import * as orchestratorEngine from './orchestrator-engine';
+import * as sessionNotify from './sessionNotify';
 import { readMemory } from './ask';
 import * as github from './github';
 import * as linear from './linear';
@@ -315,6 +316,7 @@ function publicSettings(): PublicSettings {
     sessionMemoryMb: db.settings.sessionMemoryMb ?? 'auto',
     // Derived, so the board can show what "Auto" means on this machine today.
     sessionMemoryAutoMb: runner.autoSessionMemoryMb(),
+    notifySessions: db.settings.notifySessions !== false,
   };
 }
 
@@ -666,6 +668,14 @@ app.patch('/api/settings', (req: Request, res: Response) => {
       }
       db.settings.sessionMemoryMb = mb;
     }
+  }
+  // Session notices (server/sessionNotify.ts). Strictly a boolean: this one
+  // decides whether Ployd types into a live shell, so a stray value is refused
+  // rather than coerced. Turning it off drops whatever is still queued.
+  if ('notifySessions' in req.body) {
+    if (typeof req.body.notifySessions !== 'boolean') return err(res, 400, 'notifySessions must be true or false');
+    db.settings.notifySessions = req.body.notifySessions;
+    if (!db.settings.notifySessions) sessionNotify.clear();
   }
   if ('autoResolveConflicts' in req.body) db.settings.autoResolveConflicts = !!req.body.autoResolveConflicts;
   if ('assignPrToSelf' in req.body) db.settings.assignPrToSelf = !!req.body.assignPrToSelf;
@@ -2178,6 +2188,9 @@ async function start(port: string | number = process.env.PORT || 7777): Promise<
   // already sees them; otherwise its saved tabs would be pruned as dead.
   if (!terminalsRestored) {
     terminalsRestored = true;
+    // A restored shell's PLOYD_URL is read now, before we listen; when the port
+    // is already known, point it at the real one rather than the default.
+    if (Number(port) > 0) runner.setBaseUrl(`http://127.0.0.1:${Number(port)}`);
     try {
       await restoreTerminalSessions();
     } catch (e) {
@@ -2204,6 +2217,9 @@ async function start(port: string | number = process.env.PORT || 7777): Promise<
       // watchers of any orchestration left `waiting` before a restart (see
       // server/orchestrator-engine.ts). A no-op until an orchestration actually exists.
       orchestratorEngine.start();
+      // Session notices: a task created from a terminal session reports back to
+      // it when it lands (see server/sessionNotify.ts).
+      sessionNotify.start();
       resolve({ server, port: listenPort, url });
       backfillRepoNames();
     });
