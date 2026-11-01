@@ -1,6 +1,6 @@
 {
   "name": "ployd",
-  "version": "0.18.1",
+  "version": "0.19.0",
   "description": "Ployd — local orchestrator hub for coding-agent tasks across your repos",
   "main": "dist/electron/main.js",
   "scripts": {
