@@ -1,6 +1,7 @@
 /* Ployd — terminal. No build step: native ES module. */
 import { api, esc, toast } from '../core/api.js';
 import { $, icon, state } from '../core/state.js';
+import { renderSidebar } from './sidebar.js';
 import { activePane, activateTab, activeTabKey, applyPanes, cycleTab, noteSessionTab, pruneTabs, renderTabStrip, showTerminalPane, tabHotkey, tabsOn } from './tabs.js';
 
 
@@ -19,7 +20,7 @@ import { activePane, activateTab, activeTabKey, applyPanes, cycleTab, noteSessio
 //
 // Reachable from: the workspace header's Terminal button, a task card's own
 // Terminal button (openTaskTerminal — the checkout that card works in), the
-// project sidebar's Sessions group, either tab strip, ⌘K, and the hotkeys below.
+// session rows under each project in the sidebar, either tab strip, ⌘K, and the hotkeys below.
 
 // Server-side status → the bullet every surface shows. Green: alive and
 // printing. Amber: alive but quiet for a while — sitting at a prompt, probably
@@ -309,6 +310,7 @@ function focusSession(id) {
   activeId = id;
   for (const [pid, p] of panes) p.el.classList.toggle('hidden', pid !== id);
   renderSessionTabs();
+  renderSidebar(); // the rail highlights the session in front
   fitTerminal(true);
   pane.xterm.focus();
 }

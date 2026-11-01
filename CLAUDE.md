@@ -517,30 +517,49 @@ on every launch. `startServer()` in `electron/main.ts` walks a fixed ladder
 to an OS-assigned port only if the whole ladder is busy. Don't hand `0` back to
 `server.start()` as the normal path.
 
-The **project sidebar** (`renderSidebar` and friends in `public/features/sidebar.js`) lists every
-repository — repos whose `origin` remote shares an owner (`anplabs/intranet`,
-`anplabs/platform`) folded under one collapsible **organization** heading, which is a
-container only: it groups and folds, it is not a workspace you can enter, and a lone
-repo in an org never gets one — with each repo's cards grouped by board column — grooming and orchestration cards
-included, empty columns dropped — under an "All projects" entry that returns to the
-Super View, plus a **Sessions** group per project (see "Terminal sessions"). Where
-cards are concerned it is **navigation only**: clicking a project enters that
-workspace, clicking a card opens the same drawer, right-clicking a task opens the same
-context menu. Nothing there can change a task's state — no drag-and-drop, no dispatch
-— so the board stays the single place work moves. The one thing the rail *does* create
-is a terminal session, which is not a card and never touches the board.
+The **project sidebar** (`renderSidebar` and friends in `public/features/sidebar.js`) is
+modeled on [herdr](https://herdr.dev/)'s rail: it answers "which agent needs me?"
+first, and is not a second board. It used to list every card of every project grouped
+by board column, which read as a cramped Kanban you had to scan top to bottom. Under a
+**Home** row (the Super View) it now has two sections:
 
-Every group is capped at `SIDEBAR_MAX_ROWS` (**5**) rows, so one busy project can't
-push the next one off the rail. A truncated card group ends in a **"Show N more"**
-row that **opens that project's board** rather than growing the list — the board is
-where all of them are already laid out, in columns. The Sessions group is the one
-exception: a session has no column and no card, so its overflow row expands in place
-(and collapses again).
+- **Agents** — only the work in motion or waiting on you, across every project, in
+  three groups sorted by urgency: **Needs you** (a pending tool approval, a grooming
+  or orchestration with questions), **Working** (`running`, `code_review`, a live
+  grooming or orchestration, an orchestration waiting on its workers) and **Done**
+  (a run that finished in `validation`/`failed`, or a finished grooming/orchestration,
+  that you have **not opened yet**). Each row is the title over
+  `project · state · agent`. Backlog, Ready, Done-status tasks and anything already
+  seen stay on the board only.
+- **Projects** — one row per repo: avatar, name, the checked-out branch, and a status
+  rolled up from its agents (a Needs-you or Working count pill, else a Done/idle glyph).
+  The repo's **terminal sessions** nest under it like tabs under a herdr space, and a
+  terminal button on hover starts a new one. Repos whose `origin` remote shares an
+  owner (`anplabs/intranet`, `anplabs/platform`) fold under one collapsible
+  **organization** heading — a container only, never a workspace, never for a lone
+  repo — which shows the group's rolled-up glyph while folded.
 
-It re-renders off `renderBoard()`, the same
-choke point the board uses (a no-op in the classic layout), preserving its scroll
-position and which projects are unfolded. The classic layout is untouched by all of it:
-with `layout=classic` the rail is hidden *and* emptied.
+**"Seen" is per device** (`localStorage['ployd.sidebarSeen']`, card id → the
+`finishedAt` you saw). The drawer calls `markSeen` when it stops showing a card
+(closed, or swapped for another), not when it opens, so the row doesn't vanish under
+the cursor. A new run stamps a new `finishedAt`, so the card comes back to Done when it
+finishes again (a Code Review pass included). The first run on a device seeds the map
+with everything already finished, so Done starts empty rather than listing the whole
+Validation column; the Done heading's **Clear** marks every finished card seen.
+
+It is still **navigation only**: clicking a row opens the same drawer (switching to
+that card's workspace first), right-clicking a task opens the same context menu,
+clicking a project enters that workspace. Nothing there can change a task's state —
+no drag-and-drop, no dispatch — so the board stays the single place work moves. The
+one thing the rail creates is a terminal session, which is not a card. Each Agents
+group and each project's session list is capped at `SIDEBAR_MAX_ROWS` (**5**) rows
+and expands in place past that.
+
+It re-renders off `renderBoard()`, the same choke point the board uses (a no-op in the
+classic layout), plus `focusSession()` and `markSeen()`, preserving its scroll
+position. Its highlight follows `activeTabKey()`, so the rail and the tab strip agree
+on what is in front. The classic layout is untouched by all of it: with
+`layout=classic` the rail is hidden *and* emptied.
 
 ### The tabbed work area (sidebar layout)
 
@@ -739,7 +758,7 @@ full-height tab in the work area (sidebar — see "The tabbed work area"). The
 difference is only where `#terminal-mount` is parented, and `syncTerminalHost()`
 moves *the mount*, not each pane — so every xterm, its scrollback and its stream
 survive a layout switch untouched. Either way a session is also one row in the project
-sidebar's **Sessions** group and searchable in ⌘K.
+sidebar, nested under its project's row, and searchable in ⌘K.
 
 **Joining a card's session.** Every task card carries a Terminal icon button (and a
 matching `terminal` entry in `taskCoreActions`, so the drawer and the right-click menu

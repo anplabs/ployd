@@ -10,7 +10,7 @@ import { enterWorkspace, exitWorkspace, githubAvatarUrl } from './workspaces.js'
 // ---------- work-area tabs (sidebar layout only) ----------
 // With the project rail on the left, the area to its right becomes a tabbed
 // work surface: one tab per open project (the full board, header and filter bar
-// included) and one per in-app shell session, next to a pinned "All projects"
+// included) and one per in-app shell session, next to a pinned "Home"
 // tab for the Super View. The rail is where you *find* things; a tab is where
 // one of them stays open while you go look at another.
 //
@@ -166,7 +166,7 @@ function activateTab(key) {
 // Closing a project tab is a view change — the board and its cards are
 // untouched. Closing a session tab ends that shell, exactly like the × on the
 // docked panel's tab does; the confirmation is that it vanishes from the
-// sidebar's Sessions group too.
+// sidebar's project rows too.
 function closeTab(key) {
   const tab = findTab(key);
   if (!tab || tab.kind === 'super') return;
@@ -295,7 +295,7 @@ function renderTabStrip() {
     if (t.kind === 'session') return sessionTabHtml(t, key);
     return tabHtml({
       key,
-      label: 'All projects',
+      label: 'Home',
       tip: 'Every workspace at a glance',
       lead: `<span class="tab-icon">${icon('layout-grid')}</span>`,
       fixed: true, // home — there is always somewhere to go back to
