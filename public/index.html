@@ -932,6 +932,18 @@
                 so several parallel sessions each plan to use all of it — which is how a busy board ends up swapping
                 and freezing. This hands each session a budget instead. <strong>Auto</strong> divides a share of this
                 machine's RAM by the cap above.</p>
+              <label class="check addon">
+                <input type="checkbox" id="setting-detached-runs" />
+                <span class="addon-text">
+                  <span class="addon-label">Keep task runs going when Ployd quits or restarts</span>
+                  <span class="addon-hint">Task runs and code reviews run as their own background processes and write
+                    their output to files, so quitting the app, a crash or relaunching for an update no longer kills
+                    them — Ployd picks them back up when it starts again, and finishes any that ended while it was
+                    away. Applies to runs started after you turn it on. Grooming, orchestration and Ask still stop with
+                    the app. <span id="setting-detached-runs-windows">Not available on Windows: runs there always stop
+                    with the app.</span></span>
+                </span>
+              </label>
             </fieldset>
             <fieldset class="addons">
               <legend>Agent isolation</legend>
